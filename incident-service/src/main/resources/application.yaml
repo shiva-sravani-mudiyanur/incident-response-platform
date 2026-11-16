@@ -1,6 +1,21 @@
 spring:
   application:
     name: incident-service
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS}
+    admin:
+      auto-create: false
+    consumer:
+      group-id: ${KAFKA_CONSUMER_GROUP:incident-processors}
+      auto-offset-reset: earliest
+      enable-auto-commit: false
+    listener:
+      ack-mode: record
+      missing-topics-fatal: true
+  jackson:
+    datatype:
+      enum:
+        fail-on-numbers-for-enums: true
   datasource:
     url: jdbc:postgresql://${DB_HOST}:${DB_PORT}/${DB_NAME}
     username: ${DB_USERNAME}
@@ -21,3 +36,7 @@ management:
     web:
       exposure:
         include: health
+app:
+  kafka:
+    topic: ${KAFKA_EVENTS_TOPIC:service-events}
+    retry-interval: ${KAFKA_RETRY_INTERVAL:1s}

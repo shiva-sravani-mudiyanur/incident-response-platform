@@ -2,6 +2,7 @@ package com.umass.event.controller;
 
 import com.umass.event.dto.ServiceEvent;
 import com.umass.event.exception.GlobalExceptionHandler;
+import com.umass.event.exception.EventPublishException;
 import com.umass.event.model.EventSeverity;
 import com.umass.event.model.EventType;
 import com.umass.event.service.EventService;
@@ -153,5 +154,15 @@ class EventControllerTest {
         return new ServiceEvent(id, "payment-service", EventType.DATABASE_ERROR,
                 EventSeverity.ERROR, "Database connection failed", Instant.parse("2026-11-15T12:00:00Z"),
                 "trace-123", Map.of("database", "payments"));
+    }
+
+    @Test
+    void publicationFailureReturns503RatherThanFalseAcceptance() throws Exception {
+        when(service.accept(any())).thenThrow(new EventPublishException(new IllegalStateException("Unavailable")));
+
+        mvc.perform(post("/api/events").contentType(APPLICATION_JSON)
+                        .content(JsonMapper.builder().build().writeValueAsString(payload())))
+                .andExpect(status().isServiceUnavailable())
+                .andExpect(jsonPath("$.status").value(503));
     }
 }

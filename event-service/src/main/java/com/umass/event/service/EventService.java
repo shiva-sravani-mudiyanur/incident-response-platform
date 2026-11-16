@@ -10,12 +10,18 @@ import java.util.UUID;
 @Service
 public class EventService {
     private static final Logger log = LoggerFactory.getLogger(EventService.class);
+    private final KafkaEventPublisher publisher;
+
+    public EventService(KafkaEventPublisher publisher) {
+        this.publisher = publisher;
+    }
 
     public ServiceEvent accept(ServiceEvent event) {
         UUID eventId = event.eventId() == null ? UUID.randomUUID() : event.eventId();
         Map<String, String> metadata = event.metadata() == null ? Map.of() : Map.copyOf(event.metadata());
         ServiceEvent accepted = new ServiceEvent(eventId, event.serviceName(), event.eventType(),
                 event.severity(), event.message(), event.timestamp(), event.traceId(), metadata);
+        publisher.publish(accepted);
         // Log identifiers, not potentially sensitive message/metadata payloads.
         String logServiceName = accepted.serviceName().replace('\r', '_').replace('\n', '_');
         log.info("Accepted event eventId={} serviceName={} eventType={} severity={} timestamp={}",

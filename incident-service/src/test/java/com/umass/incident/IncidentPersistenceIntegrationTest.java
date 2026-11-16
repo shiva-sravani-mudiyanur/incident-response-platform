@@ -53,6 +53,8 @@ class IncidentPersistenceIntegrationTest {
         postgres.start();
         application = new SpringApplicationBuilder(IncidentServiceApplication.class).run(
                 "--server.port=0",
+                "--KAFKA_BOOTSTRAP_SERVERS=127.0.0.1:1",
+                "--spring.kafka.listener.auto-startup=false",
                 "--DB_HOST=" + postgres.getHost(),
                 "--DB_PORT=" + postgres.getMappedPort(5432),
                 "--DB_NAME=" + postgres.getDatabaseName(),

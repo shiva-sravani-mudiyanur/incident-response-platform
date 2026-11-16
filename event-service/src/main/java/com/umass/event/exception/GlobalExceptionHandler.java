@@ -11,6 +11,12 @@ import java.util.TreeMap;
 
 @RestControllerAdvice
 public class GlobalExceptionHandler {
+    @ExceptionHandler(EventPublishException.class)
+    public ProblemDetail handlePublicationFailure(EventPublishException exception) {
+        return ProblemDetail.forStatusAndDetail(HttpStatus.SERVICE_UNAVAILABLE,
+                "Event publication could not be confirmed. Retry later.");
+    }
+
     @ExceptionHandler(MethodArgumentNotValidException.class)
     public ProblemDetail handleValidation(MethodArgumentNotValidException exception) {
         Map<String, String> errors = new TreeMap<>();

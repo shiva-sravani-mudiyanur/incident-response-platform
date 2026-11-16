@@ -6,10 +6,10 @@ A portfolio-focused distributed incident response platform. The intended system 
 
 | Service | Default HTTP port | Purpose | Runtime dependencies |
 | --- | --- | --- | --- |
-| incident-service | 8080 | Create, retrieve, filter, and update durable incidents | PostgreSQL |
-| event-service | 8082 | Validate operational events, assign missing IDs, log acceptance, and acknowledge with 202 | None |
+| incident-service | 8080 | Manage incidents and consume/persist operational events | PostgreSQL, Kafka |
+| event-service | 8082 | Validate operational events, assign missing IDs, publish JSON to Kafka, and acknowledge with 202 | Kafka |
 
-Both modules use Java 21 and Spring Boot 4.0.9, inherited from the root Maven POM. Each runs as its own application in a separate terminal. SERVER_PORT can override its default port. There is no call or message pipeline between the services yet: posting an event does not create an incident.
+Both modules use Java 21 and Spring Boot 4.0.9, inherited from the root Maven POM. Each runs as its own application in a separate terminal. SERVER_PORT can override its default port. Stage 4 connects them through Kafka: posting an event stores an incident_events row asynchronously, but does not create an incident.
 
 ## Stages 1–2: Incident Service and PostgreSQL Persistence
 
@@ -19,34 +19,36 @@ The Maven parent is named `incident-response-platform`. The existing checkout di
 
 ```text
 pom.xml                         Maven parent and module list
-docker-compose.yml              Local PostgreSQL with health check and persistent volume
+docker-compose.yml              PostgreSQL, KRaft Kafka, and topic initialization
 .env.example                    Optional Compose configuration template; no real password
 incident-service/
   pom.xml                       Service dependencies and executable JAR build
   src/main/java/com/umass/incident/
     controller/                 HTTP requests and responses only
-    service/                    Creation, lookup, filtering, and status updates
+    service/                    Incident operations and validated event persistence
+    consumer/                   Typed Kafka listener delegating to the service
     repository/                 Spring Data JPA persistence
-    model/                      Incident entity and enums
+    model/                      Incident/IncidentEvent entities and enums
     dto/                        Validated request and response contracts
-    config/                     Injectable UTC clock
+    config/                     Injectable UTC clock and typed Kafka consumer factory
     exception/                  Controlled API errors
   src/main/resources/
     application.yaml            Environment-based runtime configuration
     db/migration/               Flyway-managed PostgreSQL schema
   src/test/java/                Unit, controller, and real PostgreSQL/HTTP tests
 event-service/
-  pom.xml                       Independent web service; no database or broker dependencies
+  pom.xml                       Web service with a Kafka producer; no database dependency
   src/main/java/com/umass/event/
     EventServiceApplication.java
     controller/                 POST /api/events
-    service/                    ID assignment and acceptance logging
+    service/                    ID assignment, acknowledged Kafka publishing, safe logging
+    config/                     Explicit JSON serializer using Boot's configured mapper
     dto/                        ServiceEvent and EventAcceptedResponse
     model/                      EventType and EventSeverity enums
     exception/                  Validation and malformed-request ProblemDetail responses
   src/main/resources/
     application.yaml            Configurable port and strict enum-number handling
-  src/test/java/                Service, MockMvc, and real HTTP tests
+  src/test/java/                Service, MockMvc, and real Kafka/HTTP tests
 ```
 
 Request flow:
@@ -58,13 +60,13 @@ HTTP -> IncidentController -> IncidentService -> IncidentRepository -> PostgreSQ
 
 JPA entities are never returned from controllers. Creation assigns a UUID, OPEN status, and UTC creation/update timestamps on the server. The caller supplies title, severity, rootService, and errorCount. Timestamp precision is normalized to PostgreSQL microseconds so a creation response matches subsequent retrieval. Status updates preserve identity, creation time, and other incident fields. All three defined statuses are accepted; no transition restrictions are introduced in this stage.
 
-Stage 2 adds a PostgreSQL-only Docker Compose service. The Java application still runs natively on Windows; it is not containerized. No Kafka, Redis, AI, MCP, Gateway, or Kubernetes configuration is implemented. Actuator is a dependency with only its basic health endpoint exposed; custom operational health APIs belong to a later stage.
+Stage 2 added PostgreSQL persistence; Stage 4 adds KRaft Kafka and a topic initializer to Compose. Both Java applications still run natively on Windows, not in containers. Redis, AI, MCP, Gateway, and Kubernetes remain unimplemented. Only basic Actuator health is exposed; custom diagnostic APIs belong to a later stage.
 
 ## Prerequisites
 
 - A full JDK 21, including `javac` (a Java runtime alone is not sufficient).
 - Windows PowerShell and the included Windows Maven wrapper (`.\mvnw.cmd`). A separate Maven installation is optional.
-- Docker Desktop with Docker Compose, for the development PostgreSQL service and real PostgreSQL Testcontainers integration tests. No local PostgreSQL installation is needed.
+- Docker Desktop with Docker Compose, for PostgreSQL/Kafka and real Testcontainers integration tests. No local PostgreSQL or Kafka installation is needed.
 
 Run the following in Windows PowerShell from the project directory:
 
@@ -106,16 +108,21 @@ The default suite includes:
 - IncidentServiceTest: creation, retrieval, not found, status update, filtering, unfiltered listing, missing-update protection, and timestamp precision.
 - IncidentControllerTest: creation, retrieval, listing/filtering, status update, validation, malformed JSON/UUID/enums, missing incidents, and invalid updates.
 - IncidentPersistenceIntegrationTest: actual PostgreSQL migration and DB_* configuration, repository save/retrieve/filter, persisted service status updates, transaction commit, rollback after a flushed insert, rollback after a failed flushed update, and real HTTP lifecycle/error behavior.
-- EventServiceTest: missing/supplied event IDs, optional metadata, immutable accepted metadata, and safe acceptance logging.
-- EventControllerTest: valid event acceptance and service delegation, missing required fields, malformed payloads, invalid UUID/timestamp/enums, metadata validation, and size limits.
-- EventApplicationIntegrationTest: real HTTP acceptance, all severity values, supplied IDs, validation, rejected numeric enum ordinals, and basic health. These tests require no database or broker.
+- EventServiceTest: normalized-event publication, missing/supplied IDs, optional metadata, immutable snapshots, safe logging, and no acceptance log on publication failure.
+- KafkaEventPublisherTest: mocked KafkaTemplate acknowledgement, asynchronous/synchronous failures, bounded waiting, and restored interruption.
+- EventControllerTest: valid acceptance, invalid input, metadata limits, and 503 when publication cannot be confirmed.
+- EventApplicationIntegrationTest: real HTTP -> real Kafka, JSON/Instant representation, no Java class headers, all severity values, validation, and health.
+- EventProcessingServiceTest and EventConsumerTest: consumer validation, field mapping, processing time, delegation, and propagation of database failures for retry.
+- KafkaEventPipelineIntegrationTest: real Kafka -> production typed listener -> PostgreSQL, V2 migration, ignored Java type headers, malformed/missing/numeric severity rejection without blocking subsequent valid events, and repeated event IDs.
 
-The incident-service integration suite always starts a real disposable PostgreSQL Testcontainer and stops it after the suite. It uses random mapped ports and generated test credentials, passing the five DB_* settings into the application under test. It never uses H2, your Compose database, or your Windows PostgreSQL data. There is no external-database fallback. Those PostgreSQL tests fail rather than silently skipping when Docker is unavailable. They execute during `mvn test` as well as `mvn verify`; you do not need to run `docker compose up` first.
+Integration tests start disposable Kafka and/or PostgreSQL Testcontainers and stop them afterward. They use random mapped ports and generated database credentials, never H2 or a developer database/broker. The database-only regression suite disables listener startup; the dedicated Kafka suite exercises the production listener. Tests fail rather than silently skipping when Docker is unavailable. They execute during `mvn test` and `mvn verify`; no Compose startup or application environment variables are required first.
 
 For an explicitly limited unit/controller run without infrastructure:
 
 ```powershell
 .\mvnw.cmd -pl incident-service '-Dtest=IncidentServiceTest,IncidentControllerTest' test
+.\mvnw.cmd -pl incident-service '-Dtest=EventProcessingServiceTest,EventConsumerTest' test
+.\mvnw.cmd -pl event-service '-Dtest=EventServiceTest,EventControllerTest,KafkaEventPublisherTest' test
 ```
 
 This focused command is not a substitute for running the full suite.
@@ -124,9 +131,9 @@ This focused command is not a substitute for running the full suite.
 
 Spring Framework 7's SpringExtension requires JUnit 6. To retain the requested JUnit 5 while using Spring Boot 4.0.9, controller tests use standalone MockMvc with the real controller/advice/validation and a mocked service. Integration tests start and close a real Spring Boot application directly via SpringApplicationBuilder and use an HTTP client plus the real repository. They do not use @WebMvcTest or @SpringBootTest. Mockito is attached as a test JVM agent, avoiding dynamic-agent attachment warnings on Java 21.
 
-## Start PostgreSQL and run incident-service
+## Start PostgreSQL/Kafka and run incident-service
 
-Start Docker Desktop in Linux-container mode. From Windows PowerShell, open the repository root (the directory containing docker-compose.yml). Configure these five required settings in that same terminal:
+Start Docker Desktop in Linux-container mode. From Windows PowerShell, open the repository root (the directory containing docker-compose.yml). Configure the database and Kafka settings in that same terminal. Reuse your existing database credentials if its persistent volume already exists:
 
 ```powershell
 $env:DB_HOST = 'localhost'
@@ -136,20 +143,22 @@ $credentials = Get-Credential -UserName 'incident_app' -Message 'Choose credenti
 $env:DB_USERNAME = $credentials.UserName
 $env:DB_PASSWORD = $credentials.GetNetworkCredential().Password
 Remove-Variable credentials
+$env:KAFKA_BOOTSTRAP_SERVERS = 'localhost:9092'
 ```
 
 These are local-development examples. DB_HOST identifies the database host, DB_PORT is its published host port, DB_NAME is the database name, and DB_USERNAME/DB_PASSWORD are its login credentials. No values are hardcoded in application.yaml. DB_PORT=5433 avoids the Windows PostgreSQL service commonly listening on 5432; use another available port if needed. The old DATABASE_URL, DATABASE_USERNAME, and DATABASE_PASSWORD settings have been replaced by DB_*.
 
-Start and check PostgreSQL:
+Start and check both infrastructure services, then create the topic idempotently:
 
 ```powershell
 docker compose config --quiet
-docker compose up --wait --wait-timeout 120
+docker compose up --wait --wait-timeout 120 postgres kafka
+docker compose run --rm kafka-init
 docker compose ps
 docker compose logs postgres
 ```
 
-The postgres service must show healthy. Compose publishes it only on the local loopback interface, maps the configured host port to container port 5432, and mounts a named volume at PostgreSQL 17's data directory. The health check uses pg_isready over TCP so Compose waits for the final database server, not just its initialization process. `up --wait` runs in the background and returns after readiness; plain `docker compose up` also starts PostgreSQL but stays attached to its logs.
+Both postgres and kafka must show healthy. PostgreSQL is published only on loopback, maps DB_PORT to container port 5432, and uses a persistent named volume. Kafka is a single combined KRaft broker/controller, with no ZooKeeper. Its external listener uses localhost:9092 by default; the internal Compose listener is kafka:19092. The one-shot kafka-init creates service-events with three partitions and replication factor one; it is safe to rerun. Plain `docker compose up` also starts the initializer and stays attached to logs. The explicit two-command sequence above waits only on long-running services before running the short-lived initializer.
 
 On the first startup with an empty volume, the PostgreSQL image creates DB_NAME and the DB_USERNAME login using DB_PASSWORD. No manual database creation in pgAdmin is required. These Docker credentials are independent of any existing Windows PostgreSQL credentials. This is a local-development database; the image's initialization user is an administrator and should not be treated as a production least-privilege setup.
 
@@ -162,7 +171,7 @@ $env:SERVER_PORT = '8080'
 
 If another application uses port 8080, set SERVER_PORT to an available port such as 8081, and use that port in API requests. Keep the application terminal open and use a second terminal for HTTP requests.
 
-Flyway applies `V1__create_incidents_table.sql` when incident-service starts; Compose alone does not create the incidents table. Hibernate uses `ddl-auto=validate`: it checks the migrated schema and never creates or updates tables. A configuration/migration/connection failure prevents startup rather than silently using another database.
+Flyway applies `V1__create_incidents_table.sql` and the new `V2__create_incident_events_table.sql` when incident-service starts. Existing Stage 2/3 databases apply only the new V2; V1 is unchanged. Compose alone does not create application tables. Hibernate uses `ddl-auto=validate` and never creates or updates tables. A configuration/migration/connection failure prevents startup rather than silently using another database. Create the Kafka topic before starting the listener.
 
 ### Optional Compose .env file
 
@@ -173,7 +182,7 @@ Copy-Item .env.example .env
 notepad .env
 ```
 
-Set your own nonempty DB_PASSWORD in .env. Never commit it; .env and .env.* are ignored, while the password-free .env.example is safe to track. Docker Compose loads .env, but Spring Boot does not. When the application runs outside Docker, set the same five DB_* environment variables in PowerShell as above or in your IDE's run configuration. Shell environment values override Compose .env values, so keep them consistent. Passwords should not be pasted into commands or source files; do not share rendered `docker compose config` output because it includes resolved secrets. Use `config --quiet` for validation.
+Set your own nonempty DB_PASSWORD in .env. Never commit it; .env and .env.* are ignored, while .env.example contains no real password. Docker Compose loads .env, but Spring Boot does not. Set DB_* and KAFKA_BOOTSTRAP_SERVERS in the incident-service terminal/IDE, and KAFKA_BOOTSTRAP_SERVERS in the event-service terminal/IDE. Shell environment values override Compose .env values. Do not share rendered `docker compose config` output because it includes resolved secrets; use `config --quiet`. If changing KAFKA_PORT, also update KAFKA_BOOTSTRAP_SERVERS. KAFKA_EVENTS_TOPIC must match between both services and the initializer. Keep KAFKA_CLUSTER_ID unchanged while reusing its volume.
 
 Environment variables belong to the current PowerShell session and its child processes, not every terminal. Close the session or remove password variables when finished.
 
@@ -185,7 +194,7 @@ Stop incident-service with Ctrl+C. From a terminal with the same Compose configu
 docker compose down
 ```
 
-The named postgres_data volume is retained, so the incidents remain after the next `docker compose up --wait` and application restart. Do not use `down --volumes` unless you intentionally want to delete the Docker database. Changing DB_NAME, DB_USERNAME, or DB_PASSWORD does not reinitialize an existing volume; retain the original credentials or perform a deliberate database/user migration. This Compose setup neither imports nor modifies an existing Windows PostgreSQL database.
+The postgres_data and kafka_data volumes are retained, preserving database rows, Kafka records, and consumer offsets. To restart, repeat the infrastructure commands above and start the applications. Do not use `down --volumes` unless you intentionally want to delete both data stores. Changing DB_NAME, DB_USERNAME, or DB_PASSWORD does not reinitialize an existing volume. This setup neither imports nor modifies Windows PostgreSQL data.
 
 ### Existing Stage 1 databases
 
@@ -273,16 +282,21 @@ docker compose exec postgres psql -U $env:DB_USERNAME -d $env:DB_NAME -c 'TABLE 
 
 Alternatively register a separate pgAdmin server using host localhost, port equal to DB_PORT (5433 in the example), maintenance database equal to DB_NAME, and the Docker DB_USERNAME/DB_PASSWORD. Do not select the Windows PostgreSQL server on 5432 and expect to see the separate Docker records.
 
-## Stage 3: Event Service
+## Stages 3–4: Event Service and Kafka Pipeline
 
 The second service accepts operational events from backend applications. Its current flow is:
 
 ```text
-POST /api/events -> EventController -> EventService -> acceptance log
-                 <- HTTP 202 with eventId
+POST /api/events -> EventController -> EventService -> KafkaEventPublisher
+                                                     -> service-events (JSON)
+                 <- HTTP 202 with eventId after broker acknowledgement
+
+service-events -> EventConsumer (@KafkaListener, group incident-processors)
+               -> EventProcessingService (validate, log, transaction)
+               -> IncidentEventRepository -> PostgreSQL incident_events
 ```
 
-There is deliberately no repository, database, Kafka producer, Redis connection, queue, incident creation, or inter-service HTTP call in event-service. A 202 response is an ingestion acknowledgement for this stage, not a promise that an event has been durably stored or processed by a background worker. Accepted events are logged only; there is no event retrieval endpoint or deduplication yet.
+Stage 3 introduced validated acceptance. Stage 4 now publishes the normalized ServiceEvent as JSON, keyed by serviceName. A 202 confirms broker acknowledgement, not completed database processing. A failed/unconfirmed publication returns 503 rather than false acceptance. A timeout can occur after Kafka accepted a record, so retries should reuse a supplied eventId. There is no event retrieval endpoint, Redis, correlation, automatic incident creation, or inter-service HTTP call.
 
 ### Run event-service on Windows
 
@@ -290,10 +304,11 @@ In a separate Windows PowerShell terminal at the repository root:
 
 ```powershell
 $env:SERVER_PORT = '8082'
+$env:KAFKA_BOOTSTRAP_SERVERS = 'localhost:9092'
 .\mvnw.cmd -pl event-service spring-boot:run
 ```
 
-No DB_* variables or Docker containers are needed to run event-service alone. incident-service can continue running in its own terminal on 8080 (or its configured port). Explicitly setting SERVER_PORT avoids reusing a different service's port from your terminal environment. Stop either application with Ctrl+C in its own terminal.
+event-service needs Kafka and the topic initialized above, but no DB_* variables or running incident-service. Events remain in Kafka until incident-service consumes them. incident-service runs in its own terminal with its database and Kafka settings. Explicitly setting SERVER_PORT prevents port reuse from another service's environment. Stop either application with Ctrl+C in its own terminal.
 
 After a root build, event-service can alternatively be started as an executable JAR:
 
@@ -359,7 +374,7 @@ Remove serviceName or severity and resend: expect 400 with an errors map naming 
 
 ### Event-service tests
 
-Run all event-service tests, including its real HTTP tests, without Docker or PostgreSQL:
+Run all event-service tests, including real HTTP/Kafka Testcontainers tests (Docker required; no PostgreSQL required):
 
 ```powershell
 .\mvnw.cmd -pl event-service test
@@ -368,11 +383,39 @@ Run all event-service tests, including its real HTTP tests, without Docker or Po
 Run just the event service/controller unit tests:
 
 ```powershell
-.\mvnw.cmd -pl event-service '-Dtest=EventServiceTest,EventControllerTest' test
+.\mvnw.cmd -pl event-service '-Dtest=EventServiceTest,EventControllerTest,KafkaEventPublisherTest' test
 ```
 
-The root command `.\mvnw.cmd clean verify` builds and tests both services; it still requires Docker Desktop for incident-service's PostgreSQL Testcontainers tests. No event-service container or broker is added to docker-compose.yml in this stage.
+The root command `.\mvnw.cmd clean verify` builds and tests both services with real Kafka/PostgreSQL Testcontainers. Compose runs infrastructure only; application containerization is not part of Stage 4.
+
+## Stage 4: Kafka delivery and database verification
+
+Serialization is configured in KafkaProducerConfiguration/KafkaConsumerConfiguration using Spring Kafka's Jackson 3 serializers and Boot's configured JSON mapper. The producer sends no Java class-name headers; the consumer always targets its own ServiceEvent DTO and ignores incoming type headers. Event-service and incident-service have no Maven dependency on each other. The consumer requires an eventId, even though HTTP requests may omit it: event-service assigns it before publication.
+
+The incident_events table stores event_id (primary key), service_name, event_type, severity, message, timestamp, nullable trace_id, and processed_at. Source and processing instants use PostgreSQL microsecond precision. Metadata travels in Kafka JSON but is not persisted in this initial table. Nothing is added to incidents automatically.
+
+Consumer auto-commit is disabled. RECORD acknowledgement commits after the transactional processing method returns successfully. Database failures propagate and retry indefinitely with a configurable interval; they are not intentionally skipped. Invalid DTOs and malformed JSON are logged with topic/partition/offset and skipped so a poison record does not block following valid events. There is no dead-letter topic in this stage. Logs omit raw payload/message/trace/metadata. Replayed event IDs map to the existing primary-key row; repeated deliveries may update its fields and processing timestamp. This is at-least-once processing, not an exactly-once claim or a transactional outbox.
+
+After starting infrastructure and both services, post the event shown above and save the returned eventId. Then:
+
+1. Find `Accepted event eventId=...` in event-service and `Consumed event eventId=...` in incident-service. The latter is logged after the database transaction completes.
+2. Run these inspection commands in a terminal with the same complete Compose DB_* settings. All Compose commands interpolate the whole file, even when inspecting only Kafka:
+
+```powershell
+docker compose exec kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:19092 --describe --topic service-events
+docker compose exec kafka /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server kafka:19092 --describe --group incident-processors
+docker compose exec postgres psql -U $env:DB_USERNAME -d $env:DB_NAME -c 'SELECT event_id, service_name, event_type, severity, message, timestamp, trace_id, processed_at FROM public.incident_events ORDER BY processed_at DESC LIMIT 10;'
+docker compose exec postgres psql -U $env:DB_USERNAME -d $env:DB_NAME -c 'SELECT version, script, success FROM flyway_schema_history ORDER BY installed_rank;'
+```
+
+Expect three topic partitions, the incident-processors consumer group, a database row matching the exact acknowledged eventId, and successful V1/V2 migrations. PostgreSQL persistence is asynchronous; retry the query briefly if needed. pgAdmin can inspect the same table under the Docker server/database, not the separate Windows PostgreSQL instance.
+
+3. Optional backlog check: stop only incident-service with Ctrl+C, then post another event. It should still return 202 because Kafka remains available. Restart incident-service with the same environment and confirm its event row appears.
+4. Repeat the malformed HTTP checks above: these still return 400. A Kafka outage or unconfirmed broker acknowledgement returns 503; do not interpret a basic health response as proof of broker connectivity. If retrying an uncertain publication, supply the same eventId.
+5. Stop both applications before `docker compose down`. Restart infrastructure with the two commands above, then the services, and verify the event row remains. Do not remove volumes.
+
+The Kafka Compose image is pinned to apache/kafka:4.1.2. This is local-development infrastructure: a single broker/controller, replication factor one, PLAINTEXT listeners, loopback-only host publishing, and persistent kafka_data storage. It is not a production high-availability or authenticated cluster. If changing host ports, keep advertised-listener and application bootstrap settings consistent.
 
 ## Current boundaries
 
-Incident persistence and event acceptance are separate synchronous flows. Event acceptance currently validates and logs only. There is no authentication, pagination, advanced state machine, Kafka/Redis integration, automatic incident correlation, or AI investigation. Those capabilities are not implied by the architecture goal. No framework versions have been changed, and no commits or pushes are made automatically.
+Events now travel asynchronously through Kafka into incident_events; the existing incident REST API is unchanged. There is no Redis, incident correlation, automatic incident creation, AI/MCP investigation, authentication, pagination, advanced state machine, Gateway, or Kubernetes implementation. No framework versions have been upgraded, and no commits or pushes are made automatically.

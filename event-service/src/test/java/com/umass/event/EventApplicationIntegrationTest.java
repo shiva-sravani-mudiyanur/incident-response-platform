@@ -1,6 +1,13 @@
 package com.umass.event;
 
 import com.umass.event.model.EventSeverity;
+import org.apache.kafka.clients.admin.Admin;
+import org.apache.kafka.clients.admin.NewTopic;
+import org.apache.kafka.clients.consumer.ConsumerConfig;
+import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.clients.consumer.KafkaConsumer;
+import org.apache.kafka.common.serialization.StringDeserializer;
+import org.testcontainers.kafka.KafkaContainer;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -20,20 +27,29 @@ import java.time.Duration;
 import java.util.UUID;
 import java.util.Map;
 import java.util.HashMap;
+import java.util.List;
+import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
 // Start the real application directly to retain JUnit 5 with Spring Framework 7.
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
 class EventApplicationIntegrationTest {
+    private KafkaContainer kafka;
     private ConfigurableApplicationContext application;
     private HttpClient client;
     private ObjectMapper mapper;
     private String baseUrl;
 
     @BeforeAll
-    void startApplication() {
-        application = new SpringApplicationBuilder(EventServiceApplication.class).run("--server.port=0");
+    void startApplication() throws Exception {
+        kafka = new KafkaContainer("apache/kafka:4.1.2");
+        kafka.start();
+        try (var admin = Admin.create(Map.of("bootstrap.servers", kafka.getBootstrapServers()))) {
+            admin.createTopics(List.of(new NewTopic("service-events", 1, (short) 1))).all().get(20, TimeUnit.SECONDS);
+        }
+        application = new SpringApplicationBuilder(EventServiceApplication.class).run("--server.port=0",
+                "--KAFKA_BOOTSTRAP_SERVERS=" + kafka.getBootstrapServers());
         mapper = application.getBean(ObjectMapper.class);
         client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).build();
         int port = ((WebServerApplicationContext) application).getWebServer().getPort();
@@ -47,14 +63,20 @@ class EventApplicationIntegrationTest {
                 client.close();
             }
         } finally {
-            if (application != null) {
-                application.close();
+            try {
+                if (application != null) {
+                    application.close();
+                }
+            } finally {
+                if (kafka != null) {
+                    kafka.stop();
+                }
             }
         }
     }
 
     @Test
-    void realHttpAcceptsEventWithoutDatabaseOrMessaging() throws Exception {
+    void realHttpPublishesJsonToKafkaWithoutJavaTypeHeaders() throws Exception {
         var response = post("""
                 {"serviceName":"payment-service","eventType":"DATABASE_ERROR","severity":"ERROR",
                  "message":"Database connection failed","timestamp":"2026-11-15T12:00:00Z"}
@@ -63,6 +85,16 @@ class EventApplicationIntegrationTest {
         assertThat(response.statusCode()).isEqualTo(202);
         String id = mapper.readTree(response.body()).get("eventId").asString();
         assertThat(UUID.fromString(id)).isNotNull();
+        try (var consumer = rawConsumer()) {
+            consumer.subscribe(List.of("service-events"));
+            ConsumerRecord<String, String> record = findEvent(consumer, id);
+            var json = mapper.readTree(record.value());
+            assertThat(record.key()).isEqualTo("payment-service");
+            assertThat(json.get("eventId").asString()).isEqualTo(id);
+            assertThat(json.get("severity").asString()).isEqualTo("ERROR");
+            assertThat(json.get("timestamp").asString()).isEqualTo("2026-11-15T12:00:00Z");
+            assertThat(record.headers().lastHeader("__TypeId__")).isNull();
+        }
     }
 
     @Test
@@ -126,6 +158,28 @@ class EventApplicationIntegrationTest {
         payload.put("message", "Database connection failed");
         payload.put("timestamp", "2026-11-15T12:00:00Z");
         return payload;
+    }
+
+    private KafkaConsumer<String, String> rawConsumer() {
+        return new KafkaConsumer<>(Map.of(
+                ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, kafka.getBootstrapServers(),
+                ConsumerConfig.GROUP_ID_CONFIG, "json-contract-" + UUID.randomUUID(),
+                ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest",
+                ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, false,
+                ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class,
+                ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class));
+    }
+
+    private ConsumerRecord<String, String> findEvent(KafkaConsumer<String, String> consumer, String id) {
+        long deadline = System.nanoTime() + Duration.ofSeconds(20).toNanos();
+        while (System.nanoTime() < deadline) {
+            for (var record : consumer.poll(Duration.ofMillis(250))) {
+                if (mapper.readTree(record.value()).get("eventId").asString().equals(id)) {
+                    return record;
+                }
+            }
+        }
+        throw new AssertionError("Accepted event was not found in Kafka: " + id);
     }
 
     private HttpResponse<String> post(String body) throws Exception {
