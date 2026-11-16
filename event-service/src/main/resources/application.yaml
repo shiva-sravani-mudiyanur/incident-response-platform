@@ -1,0 +1,17 @@
+spring:
+  application:
+    name: event-service
+  jackson:
+    datatype:
+      enum:
+        fail-on-numbers-for-enums: true
+server:
+  port: ${SERVER_PORT:8082}
+  error:
+    include-message: never
+    include-stacktrace: never
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health

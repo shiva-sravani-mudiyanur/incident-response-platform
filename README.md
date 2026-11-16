@@ -1,6 +1,15 @@
 # incident-response-platform
 
-A portfolio-focused distributed incident response platform. The intended system will ingest operational events, correlate failures deterministically, persist incidents, and eventually provide evidence-grounded AI investigations. Only the explicitly requested stage is implemented.
+A portfolio-focused distributed incident response platform. The intended system will ingest operational events, correlate failures deterministically, persist incidents, and eventually provide evidence-grounded AI investigations. Only the completed stages described below are implemented.
+
+## Current services
+
+| Service | Default HTTP port | Purpose | Runtime dependencies |
+| --- | --- | --- | --- |
+| incident-service | 8080 | Create, retrieve, filter, and update durable incidents | PostgreSQL |
+| event-service | 8082 | Validate operational events, assign missing IDs, log acceptance, and acknowledge with 202 | None |
+
+Both modules use Java 21 and Spring Boot 4.0.9, inherited from the root Maven POM. Each runs as its own application in a separate terminal. SERVER_PORT can override its default port. There is no call or message pipeline between the services yet: posting an event does not create an incident.
 
 ## Stages 1–2: Incident Service and PostgreSQL Persistence
 
@@ -26,6 +35,18 @@ incident-service/
     application.yaml            Environment-based runtime configuration
     db/migration/               Flyway-managed PostgreSQL schema
   src/test/java/                Unit, controller, and real PostgreSQL/HTTP tests
+event-service/
+  pom.xml                       Independent web service; no database or broker dependencies
+  src/main/java/com/umass/event/
+    EventServiceApplication.java
+    controller/                 POST /api/events
+    service/                    ID assignment and acceptance logging
+    dto/                        ServiceEvent and EventAcceptedResponse
+    model/                      EventType and EventSeverity enums
+    exception/                  Validation and malformed-request ProblemDetail responses
+  src/main/resources/
+    application.yaml            Configurable port and strict enum-number handling
+  src/test/java/                Service, MockMvc, and real HTTP tests
 ```
 
 Request flow:
@@ -72,6 +93,8 @@ From the repository root:
 .\mvnw.cmd clean verify
 ```
 
+On Windows, stop any application launched with `java -jar` from a module's target directory before using clean/verify; its running JVM can lock that JAR. To run every test without deleting/repackaging a running JAR, use `.\mvnw.cmd test` instead.
+
 Equivalent with Maven installed:
 
 ```powershell
@@ -83,8 +106,11 @@ The default suite includes:
 - IncidentServiceTest: creation, retrieval, not found, status update, filtering, unfiltered listing, missing-update protection, and timestamp precision.
 - IncidentControllerTest: creation, retrieval, listing/filtering, status update, validation, malformed JSON/UUID/enums, missing incidents, and invalid updates.
 - IncidentPersistenceIntegrationTest: actual PostgreSQL migration and DB_* configuration, repository save/retrieve/filter, persisted service status updates, transaction commit, rollback after a flushed insert, rollback after a failed flushed update, and real HTTP lifecycle/error behavior.
+- EventServiceTest: missing/supplied event IDs, optional metadata, immutable accepted metadata, and safe acceptance logging.
+- EventControllerTest: valid event acceptance and service delegation, missing required fields, malformed payloads, invalid UUID/timestamp/enums, metadata validation, and size limits.
+- EventApplicationIntegrationTest: real HTTP acceptance, all severity values, supplied IDs, validation, rejected numeric enum ordinals, and basic health. These tests require no database or broker.
 
-The integration suite always starts a real disposable PostgreSQL Testcontainer and stops it after the suite. It uses random mapped ports and generated test credentials, passing the five DB_* settings into the application under test. It never uses H2, your Compose database, or your Windows PostgreSQL data. There is no external-database fallback. Integration tests fail rather than silently skipping when Docker is unavailable. They execute during `mvn test` as well as `mvn verify`; you do not need to run `docker compose up` first.
+The incident-service integration suite always starts a real disposable PostgreSQL Testcontainer and stops it after the suite. It uses random mapped ports and generated test credentials, passing the five DB_* settings into the application under test. It never uses H2, your Compose database, or your Windows PostgreSQL data. There is no external-database fallback. Those PostgreSQL tests fail rather than silently skipping when Docker is unavailable. They execute during `mvn test` as well as `mvn verify`; you do not need to run `docker compose up` first.
 
 For an explicitly limited unit/controller run without infrastructure:
 
@@ -247,6 +273,106 @@ docker compose exec postgres psql -U $env:DB_USERNAME -d $env:DB_NAME -c 'TABLE 
 
 Alternatively register a separate pgAdmin server using host localhost, port equal to DB_PORT (5433 in the example), maintenance database equal to DB_NAME, and the Docker DB_USERNAME/DB_PASSWORD. Do not select the Windows PostgreSQL server on 5432 and expect to see the separate Docker records.
 
+## Stage 3: Event Service
+
+The second service accepts operational events from backend applications. Its current flow is:
+
+```text
+POST /api/events -> EventController -> EventService -> acceptance log
+                 <- HTTP 202 with eventId
+```
+
+There is deliberately no repository, database, Kafka producer, Redis connection, queue, incident creation, or inter-service HTTP call in event-service. A 202 response is an ingestion acknowledgement for this stage, not a promise that an event has been durably stored or processed by a background worker. Accepted events are logged only; there is no event retrieval endpoint or deduplication yet.
+
+### Run event-service on Windows
+
+In a separate Windows PowerShell terminal at the repository root:
+
+```powershell
+$env:SERVER_PORT = '8082'
+.\mvnw.cmd -pl event-service spring-boot:run
+```
+
+No DB_* variables or Docker containers are needed to run event-service alone. incident-service can continue running in its own terminal on 8080 (or its configured port). Explicitly setting SERVER_PORT avoids reusing a different service's port from your terminal environment. Stop either application with Ctrl+C in its own terminal.
+
+After a root build, event-service can alternatively be started as an executable JAR:
+
+```powershell
+$env:SERVER_PORT = '8082'
+java -jar .\event-service\target\event-service-0.0.1-SNAPSHOT.jar
+```
+
+### Event request contract
+
+POST /api/events requires Content-Type: application/json. The ServiceEvent DTO contains:
+
+| Field | Type | Validation/behavior |
+| --- | --- | --- |
+| eventId | UUID | Optional; omitted/null generates a UUID; a supplied valid UUID is preserved |
+| serviceName | String | Required, nonblank, maximum 100 characters |
+| eventType | EventType | Required; one of the named values below |
+| severity | EventSeverity | Required; INFO, WARNING, ERROR, CRITICAL |
+| message | String | Required, nonblank, maximum 4000 characters |
+| timestamp | Instant | Required ISO-8601 instant, for example 2026-11-15T12:00:00Z; not generated by the service |
+| traceId | String | Optional, maximum 128 characters |
+| metadata | Map of String to String | Optional; omitted/null becomes an empty accepted map; maximum 50 entries, nonblank keys up to 100 characters, nonnull values up to 1000 characters |
+
+The initial EventType values are SERVICE_STARTED, SERVICE_STOPPED, REQUEST_FAILED, DATABASE_ERROR, DEPENDENCY_ERROR, TIMEOUT. This small initial contract was chosen because the Stage 3 request did not specify event-type values. Enum names are case-sensitive; unknown names and numeric enum ordinals are rejected.
+
+The response is an EventAcceptedResponse containing only eventId. Logging includes eventId, serviceName, eventType, severity, and timestamp. Raw message, traceId, and metadata are not logged or echoed in the acknowledgement; line breaks in the logged service name are sanitized. The accepted service object retains its payload and a defensive, immutable metadata snapshot.
+
+### Verify event acceptance
+
+In another PowerShell terminal:
+
+```powershell
+$env:EVENT_API_BASE_URL = 'http://localhost:8082'
+$eventRequest = @{
+    serviceName = 'payment-service'
+    eventType = 'DATABASE_ERROR'
+    severity = 'ERROR'
+    message = 'Database connection failed'
+    timestamp = [DateTime]::UtcNow.ToString('o')
+    traceId = [Guid]::NewGuid().ToString()
+    metadata = @{ database = 'payments' }
+} | ConvertTo-Json -Depth 3
+$accepted = Invoke-RestMethod -Uri "$env:EVENT_API_BASE_URL/api/events" -Method Post -ContentType 'application/json' -Body $eventRequest
+$accepted
+Invoke-RestMethod -Uri "$env:EVENT_API_BASE_URL/actuator/health"
+```
+
+Expect HTTP 202, an eventId, an `Accepted event` entry in the event-service terminal with that ID, and health UP. In Postman, use POST to http://localhost:8082/api/events with Body > raw > JSON:
+
+```json
+{
+  "serviceName": "payment-service",
+  "eventType": "DATABASE_ERROR",
+  "severity": "ERROR",
+  "message": "Database connection failed",
+  "timestamp": "2026-11-15T12:00:00Z",
+  "traceId": "trace-123",
+  "metadata": { "database": "payments" }
+}
+```
+
+Remove serviceName or severity and resend: expect 400 with an errors map naming the missing field. An empty body, malformed JSON, invalid UUID/timestamp, or unknown enum also returns a controlled 400 ProblemDetail response. To test ID preservation, include an actual valid eventId UUID and confirm the acknowledgement returns exactly that value. Posting here must not add rows to the incidents table.
+
+### Event-service tests
+
+Run all event-service tests, including its real HTTP tests, without Docker or PostgreSQL:
+
+```powershell
+.\mvnw.cmd -pl event-service test
+```
+
+Run just the event service/controller unit tests:
+
+```powershell
+.\mvnw.cmd -pl event-service '-Dtest=EventServiceTest,EventControllerTest' test
+```
+
+The root command `.\mvnw.cmd clean verify` builds and tests both services; it still requires Docker Desktop for incident-service's PostgreSQL Testcontainers tests. No event-service container or broker is added to docker-compose.yml in this stage.
+
 ## Current boundaries
 
-This stage remains synchronous and has no authentication, pagination, advanced state machine, event ingestion, automatic correlation, or AI investigation. Those capabilities are not implied by the architecture goal. Stage 2 adds only PostgreSQL Compose infrastructure, DB_* configuration, migration naming, and persistence/transaction verification. No framework versions have been changed, and no commits or pushes are made automatically.
+Incident persistence and event acceptance are separate synchronous flows. Event acceptance currently validates and logs only. There is no authentication, pagination, advanced state machine, Kafka/Redis integration, automatic incident correlation, or AI investigation. Those capabilities are not implied by the architecture goal. No framework versions have been changed, and no commits or pushes are made automatically.
