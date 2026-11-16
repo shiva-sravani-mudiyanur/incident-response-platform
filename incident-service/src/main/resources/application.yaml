@@ -1,6 +1,14 @@
 spring:
   application:
     name: incident-service
+  data:
+    redis:
+      host: ${REDIS_HOST}
+      port: ${REDIS_PORT}
+      connect-timeout: 3s
+      timeout: 3s
+      repositories:
+        enabled: false
   kafka:
     bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS}
     admin:
@@ -40,3 +48,7 @@ app:
   kafka:
     topic: ${KAFKA_EVENTS_TOPIC:service-events}
     retry-interval: ${KAFKA_RETRY_INTERVAL:1s}
+incident:
+  correlation:
+    threshold: ${INCIDENT_CORRELATION_THRESHOLD:5}
+    window-seconds: ${INCIDENT_CORRELATION_WINDOW_SECONDS:60}

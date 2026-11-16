@@ -8,4 +8,5 @@ import java.util.List;
 
 public interface IncidentRepository extends JpaRepository<Incident, UUID> {
     List<Incident> findByStatus(IncidentStatus status);
+    boolean existsByRootServiceAndStatusIn(String rootService, List<IncidentStatus> statuses);
 }

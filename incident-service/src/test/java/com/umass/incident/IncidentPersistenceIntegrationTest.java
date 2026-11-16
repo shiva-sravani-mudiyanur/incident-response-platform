@@ -55,6 +55,8 @@ class IncidentPersistenceIntegrationTest {
                 "--server.port=0",
                 "--KAFKA_BOOTSTRAP_SERVERS=127.0.0.1:1",
                 "--spring.kafka.listener.auto-startup=false",
+                "--REDIS_HOST=127.0.0.1",
+                "--REDIS_PORT=1",
                 "--DB_HOST=" + postgres.getHost(),
                 "--DB_PORT=" + postgres.getMappedPort(5432),
                 "--DB_NAME=" + postgres.getDatabaseName(),

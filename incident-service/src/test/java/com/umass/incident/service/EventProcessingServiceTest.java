@@ -32,6 +32,8 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
+import static org.mockito.Mockito.when;
+import static org.mockito.Mockito.never;
 
 @ExtendWith(MockitoExtension.class)
 class EventProcessingServiceTest {
@@ -39,6 +41,8 @@ class EventProcessingServiceTest {
     private static ValidatorFactory validators;
     @Mock
     private IncidentEventRepository repository;
+    @Mock
+    private CorrelationService correlation;
     private EventProcessingService service;
 
     @BeforeAll
@@ -53,7 +57,7 @@ class EventProcessingServiceTest {
 
     @BeforeEach
     void setUp() {
-        service = new EventProcessingService(repository, validators.getValidator(), Clock.fixed(NOW, ZoneOffset.UTC));
+        service = new EventProcessingService(repository, validators.getValidator(), Clock.fixed(NOW, ZoneOffset.UTC), correlation);
     }
 
     @Test
@@ -73,13 +77,14 @@ class EventProcessingServiceTest {
         assertThat(stored.getTimestamp()).isEqualTo(event.timestamp());
         assertThat(stored.getTraceId()).isEqualTo(event.traceId());
         assertThat(stored.getProcessedAt()).isEqualTo(NOW);
+        verify(correlation).correlate(event);
     }
 
     @ParameterizedTest
     @MethodSource("invalidEvents")
     void invalidEventIsRejectedBeforePersistence(ServiceEvent event) {
         assertThatThrownBy(() -> service.process(event)).isInstanceOf(InvalidServiceEventException.class);
-        verifyNoInteractions(repository);
+        verifyNoInteractions(repository, correlation);
     }
 
     @Test
@@ -87,6 +92,24 @@ class EventProcessingServiceTest {
         doThrow(new DataAccessResourceFailureException("PostgreSQL unavailable")).when(repository).save(any());
 
         assertThatThrownBy(() -> service.process(event())).isInstanceOf(DataAccessResourceFailureException.class);
+    }
+
+    @Test
+    void alreadyPersistedEventIsNotCorrelatedAgainOnRedelivery() {
+        ServiceEvent event = event();
+        when(repository.existsById(event.eventId())).thenReturn(true);
+
+        service.process(event);
+
+        verify(repository, never()).save(any());
+        verifyNoInteractions(correlation);
+    }
+
+    @Test
+    void correlationFailurePropagatesToRollBackTheEventAndRetry() {
+        doThrow(new IllegalStateException("Redis unavailable")).when(correlation).correlate(any());
+
+        assertThatThrownBy(() -> service.process(event())).isInstanceOf(IllegalStateException.class);
     }
 
     private static Stream<ServiceEvent> invalidEvents() {

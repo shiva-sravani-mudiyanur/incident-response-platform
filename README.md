@@ -6,10 +6,10 @@ A portfolio-focused distributed incident response platform. The intended system 
 
 | Service | Default HTTP port | Purpose | Runtime dependencies |
 | --- | --- | --- | --- |
-| incident-service | 8080 | Manage incidents and consume/persist operational events | PostgreSQL, Kafka |
+| incident-service | 8080 | Manage incidents, persist events, and correlate failures automatically | PostgreSQL, Kafka, Redis |
 | event-service | 8082 | Validate operational events, assign missing IDs, publish JSON to Kafka, and acknowledge with 202 | Kafka |
 
-Both modules use Java 21 and Spring Boot 4.0.9, inherited from the root Maven POM. Each runs as its own application in a separate terminal. SERVER_PORT can override its default port. Stage 4 connects them through Kafka: posting an event stores an incident_events row asynchronously, but does not create an incident.
+Both modules use Java 21 and Spring Boot 4.0.9, inherited from the root Maven POM. Each runs as its own application in a separate terminal. SERVER_PORT can override its default port. Stage 4 connects them through Kafka and persists incident_events asynchronously. Stage 5 adds Redis-backed failure correlation and deterministic automatic incident creation without an LLM.
 
 ## Stages 1–2: Incident Service and PostgreSQL Persistence
 
@@ -19,7 +19,7 @@ The Maven parent is named `incident-response-platform`. The existing checkout di
 
 ```text
 pom.xml                         Maven parent and module list
-docker-compose.yml              PostgreSQL, KRaft Kafka, and topic initialization
+docker-compose.yml              PostgreSQL, KRaft Kafka, Redis, and topic initialization
 .env.example                    Optional Compose configuration template; no real password
 incident-service/
   pom.xml                       Service dependencies and executable JAR build
@@ -60,13 +60,13 @@ HTTP -> IncidentController -> IncidentService -> IncidentRepository -> PostgreSQ
 
 JPA entities are never returned from controllers. Creation assigns a UUID, OPEN status, and UTC creation/update timestamps on the server. The caller supplies title, severity, rootService, and errorCount. Timestamp precision is normalized to PostgreSQL microseconds so a creation response matches subsequent retrieval. Status updates preserve identity, creation time, and other incident fields. All three defined statuses are accepted; no transition restrictions are introduced in this stage.
 
-Stage 2 added PostgreSQL persistence; Stage 4 adds KRaft Kafka and a topic initializer to Compose. Both Java applications still run natively on Windows, not in containers. Redis, AI, MCP, Gateway, and Kubernetes remain unimplemented. Only basic Actuator health is exposed; custom diagnostic APIs belong to a later stage.
+Stage 2 added PostgreSQL persistence; Stage 4 added KRaft Kafka and a topic initializer to Compose; Stage 5 adds transient Redis correlation state. Both Java applications still run natively on Windows, not in containers. AI, MCP, Gateway, and Kubernetes remain unimplemented. Only basic Actuator health is exposed; custom diagnostic APIs belong to a later stage.
 
 ## Prerequisites
 
 - A full JDK 21, including `javac` (a Java runtime alone is not sufficient).
 - Windows PowerShell and the included Windows Maven wrapper (`.\mvnw.cmd`). A separate Maven installation is optional.
-- Docker Desktop with Docker Compose, for PostgreSQL/Kafka and real Testcontainers integration tests. No local PostgreSQL or Kafka installation is needed.
+- Docker Desktop with Docker Compose, for PostgreSQL/Kafka/Redis and real Testcontainers integration tests. No local PostgreSQL, Kafka, or Redis installation is needed.
 
 Run the following in Windows PowerShell from the project directory:
 
@@ -131,9 +131,9 @@ This focused command is not a substitute for running the full suite.
 
 Spring Framework 7's SpringExtension requires JUnit 6. To retain the requested JUnit 5 while using Spring Boot 4.0.9, controller tests use standalone MockMvc with the real controller/advice/validation and a mocked service. Integration tests start and close a real Spring Boot application directly via SpringApplicationBuilder and use an HTTP client plus the real repository. They do not use @WebMvcTest or @SpringBootTest. Mockito is attached as a test JVM agent, avoiding dynamic-agent attachment warnings on Java 21.
 
-## Start PostgreSQL/Kafka and run incident-service
+## Start PostgreSQL/Kafka/Redis and run incident-service
 
-Start Docker Desktop in Linux-container mode. From Windows PowerShell, open the repository root (the directory containing docker-compose.yml). Configure the database and Kafka settings in that same terminal. Reuse your existing database credentials if its persistent volume already exists:
+Start Docker Desktop in Linux-container mode. From Windows PowerShell, open the repository root (the directory containing docker-compose.yml). Configure the database, Kafka, and Redis settings in that same terminal. Reuse your existing database credentials if its persistent volume already exists:
 
 ```powershell
 $env:DB_HOST = 'localhost'
@@ -144,21 +144,25 @@ $env:DB_USERNAME = $credentials.UserName
 $env:DB_PASSWORD = $credentials.GetNetworkCredential().Password
 Remove-Variable credentials
 $env:KAFKA_BOOTSTRAP_SERVERS = 'localhost:9092'
+$env:REDIS_HOST = 'localhost'
+$env:REDIS_PORT = '6379'
+$env:INCIDENT_CORRELATION_THRESHOLD = '5'
+$env:INCIDENT_CORRELATION_WINDOW_SECONDS = '60'
 ```
 
 These are local-development examples. DB_HOST identifies the database host, DB_PORT is its published host port, DB_NAME is the database name, and DB_USERNAME/DB_PASSWORD are its login credentials. No values are hardcoded in application.yaml. DB_PORT=5433 avoids the Windows PostgreSQL service commonly listening on 5432; use another available port if needed. The old DATABASE_URL, DATABASE_USERNAME, and DATABASE_PASSWORD settings have been replaced by DB_*.
 
-Start and check both infrastructure services, then create the topic idempotently:
+Start and check all three infrastructure services, then create the topic idempotently:
 
 ```powershell
 docker compose config --quiet
-docker compose up --wait --wait-timeout 120 postgres kafka
+docker compose up --wait --wait-timeout 120 postgres kafka redis
 docker compose run --rm kafka-init
 docker compose ps
 docker compose logs postgres
 ```
 
-Both postgres and kafka must show healthy. PostgreSQL is published only on loopback, maps DB_PORT to container port 5432, and uses a persistent named volume. Kafka is a single combined KRaft broker/controller, with no ZooKeeper. Its external listener uses localhost:9092 by default; the internal Compose listener is kafka:19092. The one-shot kafka-init creates service-events with three partitions and replication factor one; it is safe to rerun. Plain `docker compose up` also starts the initializer and stays attached to logs. The explicit two-command sequence above waits only on long-running services before running the short-lived initializer.
+postgres, kafka, and redis must all show healthy. PostgreSQL is published only on loopback, maps DB_PORT to container port 5432, and uses a persistent named volume. Kafka is a single combined KRaft broker/controller, with no ZooKeeper. Its external listener uses localhost:9092 by default; the internal Compose listener is kafka:19092. Redis is pinned to redis:8.2-alpine, published only on loopback at REDIS_PORT (6379 by default), and checked with redis-cli ping. Redis is a transient cache: snapshot/AOF persistence is disabled and no persistent volume is needed. This unauthenticated Redis setup is for local development, not production. The one-shot kafka-init creates service-events with three partitions and replication factor one; it is safe to rerun. Plain `docker compose up` also starts the initializer and stays attached to logs. The explicit two-command sequence above waits only on long-running services before running the short-lived initializer.
 
 On the first startup with an empty volume, the PostgreSQL image creates DB_NAME and the DB_USERNAME login using DB_PASSWORD. No manual database creation in pgAdmin is required. These Docker credentials are independent of any existing Windows PostgreSQL credentials. This is a local-development database; the image's initialization user is an administrator and should not be treated as a production least-privilege setup.
 
@@ -182,7 +186,7 @@ Copy-Item .env.example .env
 notepad .env
 ```
 
-Set your own nonempty DB_PASSWORD in .env. Never commit it; .env and .env.* are ignored, while .env.example contains no real password. Docker Compose loads .env, but Spring Boot does not. Set DB_* and KAFKA_BOOTSTRAP_SERVERS in the incident-service terminal/IDE, and KAFKA_BOOTSTRAP_SERVERS in the event-service terminal/IDE. Shell environment values override Compose .env values. Do not share rendered `docker compose config` output because it includes resolved secrets; use `config --quiet`. If changing KAFKA_PORT, also update KAFKA_BOOTSTRAP_SERVERS. KAFKA_EVENTS_TOPIC must match between both services and the initializer. Keep KAFKA_CLUSTER_ID unchanged while reusing its volume.
+Set your own nonempty DB_PASSWORD in .env. Never commit it; .env and .env.* are ignored, while .env.example contains no real password. Docker Compose loads .env, but Spring Boot does not. Set DB_*, KAFKA_BOOTSTRAP_SERVERS, REDIS_HOST, and REDIS_PORT in the incident-service terminal/IDE, plus any correlation overrides shown above. event-service still needs only Kafka configuration, not database or Redis settings. Shell environment values override Compose .env values. Do not share rendered `docker compose config` output because it includes resolved secrets; use `config --quiet`. If changing KAFKA_PORT, also update KAFKA_BOOTSTRAP_SERVERS. If changing REDIS_PORT, use the same published port in incident-service. KAFKA_EVENTS_TOPIC must match between both services and the initializer. Keep KAFKA_CLUSTER_ID unchanged while reusing its volume.
 
 Environment variables belong to the current PowerShell session and its child processes, not every terminal. Close the session or remove password variables when finished.
 
@@ -194,7 +198,7 @@ Stop incident-service with Ctrl+C. From a terminal with the same Compose configu
 docker compose down
 ```
 
-The postgres_data and kafka_data volumes are retained, preserving database rows, Kafka records, and consumer offsets. To restart, repeat the infrastructure commands above and start the applications. Do not use `down --volumes` unless you intentionally want to delete both data stores. Changing DB_NAME, DB_USERNAME, or DB_PASSWORD does not reinitialize an existing volume. This setup neither imports nor modifies Windows PostgreSQL data.
+The postgres_data and kafka_data volumes are retained, preserving database rows, Kafka records, and consumer offsets. Redis correlation windows are transient and are lost when its container is removed/restarted; existing PostgreSQL incidents remain. To restart, repeat the infrastructure commands above and start the applications. Do not use `down --volumes` unless you intentionally want to delete both persistent data stores. Changing DB_NAME, DB_USERNAME, or DB_PASSWORD does not reinitialize an existing volume. This setup neither imports nor modifies Windows PostgreSQL data.
 
 ### Existing Stage 1 databases
 
@@ -296,7 +300,7 @@ service-events -> EventConsumer (@KafkaListener, group incident-processors)
                -> IncidentEventRepository -> PostgreSQL incident_events
 ```
 
-Stage 3 introduced validated acceptance. Stage 4 now publishes the normalized ServiceEvent as JSON, keyed by serviceName. A 202 confirms broker acknowledgement, not completed database processing. A failed/unconfirmed publication returns 503 rather than false acceptance. A timeout can occur after Kafka accepted a record, so retries should reuse a supplied eventId. There is no event retrieval endpoint, Redis, correlation, automatic incident creation, or inter-service HTTP call.
+Stage 3 introduced validated acceptance. Stage 4 publishes the normalized ServiceEvent as JSON, keyed by serviceName. A 202 confirms broker acknowledgement, not completed database processing or incident creation. A failed/unconfirmed publication returns 503 rather than false acceptance. A timeout can occur after Kafka accepted a record, so retries should reuse a supplied eventId. Stage 5 correlates consumed failures in incident-service; event-service has no Redis dependency. There is still no event retrieval endpoint or inter-service HTTP call.
 
 ### Run event-service on Windows
 
@@ -308,7 +312,7 @@ $env:KAFKA_BOOTSTRAP_SERVERS = 'localhost:9092'
 .\mvnw.cmd -pl event-service spring-boot:run
 ```
 
-event-service needs Kafka and the topic initialized above, but no DB_* variables or running incident-service. Events remain in Kafka until incident-service consumes them. incident-service runs in its own terminal with its database and Kafka settings. Explicitly setting SERVER_PORT prevents port reuse from another service's environment. Stop either application with Ctrl+C in its own terminal.
+event-service needs Kafka and the topic initialized above, but no DB_* or REDIS_* variables or running incident-service. Events remain in Kafka until incident-service consumes them. incident-service runs in its own terminal with its database, Kafka, and Redis settings. Explicitly setting SERVER_PORT prevents port reuse from another service's environment. Stop either application with Ctrl+C in its own terminal.
 
 After a root build, event-service can alternatively be started as an executable JAR:
 
@@ -370,7 +374,7 @@ Expect HTTP 202, an eventId, an `Accepted event` entry in the event-service term
 }
 ```
 
-Remove serviceName or severity and resend: expect 400 with an errors map naming the missing field. An empty body, malformed JSON, invalid UUID/timestamp, or unknown enum also returns a controlled 400 ProblemDetail response. To test ID preservation, include an actual valid eventId UUID and confirm the acknowledgement returns exactly that value. Posting here must not add rows to the incidents table.
+Remove serviceName or severity and resend: expect 400 with an errors map naming the missing field. An empty body, malformed JSON, invalid UUID/timestamp, or unknown enum also returns a controlled 400 ProblemDetail response. To test ID preservation, include an actual valid eventId UUID and confirm the acknowledgement returns exactly that value. One isolated error below the configured threshold does not create an incident; repeated qualifying failures can now create one through Stage 5.
 
 ### Event-service tests
 
@@ -386,15 +390,15 @@ Run just the event service/controller unit tests:
 .\mvnw.cmd -pl event-service '-Dtest=EventServiceTest,EventControllerTest,KafkaEventPublisherTest' test
 ```
 
-The root command `.\mvnw.cmd clean verify` builds and tests both services with real Kafka/PostgreSQL Testcontainers. Compose runs infrastructure only; application containerization is not part of Stage 4.
+The root command `.\mvnw.cmd clean verify` builds and tests both services. Compose runs infrastructure only; application containerization is not part of Stage 5.
 
 ## Stage 4: Kafka delivery and database verification
 
 Serialization is configured in KafkaProducerConfiguration/KafkaConsumerConfiguration using Spring Kafka's Jackson 3 serializers and Boot's configured JSON mapper. The producer sends no Java class-name headers; the consumer always targets its own ServiceEvent DTO and ignores incoming type headers. Event-service and incident-service have no Maven dependency on each other. The consumer requires an eventId, even though HTTP requests may omit it: event-service assigns it before publication.
 
-The incident_events table stores event_id (primary key), service_name, event_type, severity, message, timestamp, nullable trace_id, and processed_at. Source and processing instants use PostgreSQL microsecond precision. Metadata travels in Kafka JSON but is not persisted in this initial table. Nothing is added to incidents automatically.
+The incident_events table stores event_id (primary key), service_name, event_type, severity, message, timestamp, nullable trace_id, and processed_at. Source and processing instants use PostgreSQL microsecond precision. Metadata travels in Kafka JSON but is not persisted in this initial table. Stage 4 supplied durable event storage; Stage 5 adds automatic incidents using the correlation rules below.
 
-Consumer auto-commit is disabled. RECORD acknowledgement commits after the transactional processing method returns successfully. Database failures propagate and retry indefinitely with a configurable interval; they are not intentionally skipped. Invalid DTOs and malformed JSON are logged with topic/partition/offset and skipped so a poison record does not block following valid events. There is no dead-letter topic in this stage. Logs omit raw payload/message/trace/metadata. Replayed event IDs map to the existing primary-key row; repeated deliveries may update its fields and processing timestamp. This is at-least-once processing, not an exactly-once claim or a transactional outbox.
+Consumer auto-commit is disabled. RECORD acknowledgement commits after the transactional processing method returns successfully. Database or Redis failures propagate and retry indefinitely with a configurable interval; they are not intentionally skipped. Invalid DTOs and malformed JSON are logged with topic/partition/offset and skipped so a poison record does not block following valid events. There is no dead-letter topic in this stage. Logs omit raw payload/message/trace/metadata. Stage 5 skips an eventId already committed to incident_events, preserving the stored row and preventing repeated correlation, even after Redis expiry. Redis also deduplicates retried, not-yet-committed events within its window. This is at-least-once processing, not an exactly-once claim or a transactional outbox.
 
 After starting infrastructure and both services, post the event shown above and save the returned eventId. Then:
 
@@ -416,6 +420,56 @@ Expect three topic partitions, the incident-processors consumer group, a databas
 
 The Kafka Compose image is pinned to apache/kafka:4.1.2. This is local-development infrastructure: a single broker/controller, replication factor one, PLAINTEXT listeners, loopback-only host publishing, and persistent kafka_data storage. It is not a production high-availability or authenticated cluster. If changing host ports, keep advertised-listener and application bootstrap settings consistent.
 
+## Stage 5: Redis failure correlation
+
+incident-service counts only ERROR and CRITICAL events per serviceName. INFO and WARNING events are persisted but do not contribute to correlation. The default trigger is **at least 5 distinct failures within a sliding 60-second processing-time window**, not the source event timestamp. Atomic Redis sorted-set operations use Redis server TIME, prune expired members, and count the remaining UUID eventId members. Redis deduplicates the same eventId within its window; the PostgreSQL check additionally skips already committed events after Redis expiry.
+
+The per-service keys are `errors:{serviceName}` and `errors:{serviceName}:critical`. The braces are literal Redis hash tags: order-service uses `errors:{order-service}` and `errors:{order-service}:critical`. Both are sorted sets, with TTL refreshed after the last qualifying failure so idle state expires. The critical set tracks which failures in the window are CRITICAL. An automatically created incident is OPEN, has rootService equal to serviceName, uses the current window errorCount, and receives a deterministic title without an LLM. Its severity is CRITICAL if any CRITICAL failure remains in the window; otherwise it is HIGH.
+
+An existing OPEN or INVESTIGATING incident with the same rootService suppresses a new automatic incident, including when the active incident was created manually. A PostgreSQL transaction-scoped advisory lock prevents concurrent duplicate automatic creation for that service. Stage 5 does not escalate or update an existing incident. Once the active incident is RESOLVED, a fresh qualifying event may create another incident if the threshold is still met; resolution does not itself clear the Redis window. Redis and PostgreSQL do not share a distributed atomic transaction, and this is not an exactly-once guarantee.
+
+| Configuration | Local example/default | Purpose |
+| --- | --- | --- |
+| REDIS_HOST | localhost | Required Redis host for incident-service |
+| REDIS_PORT | 6379 | Required Redis port; also the Compose published port |
+| INCIDENT_CORRELATION_THRESHOLD | 5 | Failure count required to trigger an incident |
+| INCIDENT_CORRELATION_WINDOW_SECONDS | 60 | Sliding processing-time window and idle expiry |
+
+These map to `incident.correlation.threshold=5` and `incident.correlation.window-seconds=60`; both must be positive. CorrelationServiceTest covers the detection rules. RedisFailureCounterIntegrationTest covers expiry, rolling-window pruning, deduplication, and atomic concurrent updates. CorrelationIntegrationTest exercises real Redis/PostgreSQL transactions and concurrent incident suppression; KafkaEventPipelineIntegrationTest also verifies automatic incident creation through Kafka.
+
+### Windows / Postman verification
+
+Start PostgreSQL, Kafka, and Redis, run kafka-init, and start both Java services in the separate terminals described above. Use the default threshold/window (5/60) for this check. In Postman, create a unique service name such as `stage5-payment-<new UUID>` and reuse that exact name throughout this check; this avoids collisions with prior events or manually created active incidents.
+
+1. Send **five POST** requests to `http://localhost:8082/api/events`, Body > raw > JSON, within 60 seconds. Use the same unique serviceName and severity ERROR. Omit eventId as below so event-service generates a different UUID for every request, or supply a different valid UUID each time. Each should return 202. Replace the example service name once, then send the same body five times:
+
+```json
+{
+  "serviceName": "stage5-payment-replace-with-unique-suffix",
+  "eventType": "DATABASE_ERROR",
+  "severity": "ERROR",
+  "message": "Stage 5 correlation verification",
+  "timestamp": "2026-11-16T12:00:00Z"
+}
+```
+
+2. Send **GET** `http://localhost:8080/api/incidents?status=OPEN`. Consumption is asynchronous: retry briefly, then find the exact rootService. Expect **one** generated incident, a deterministic title, severity HIGH, and errorCount 5. Save its id and title. The list can contain unrelated incidents; filter by your unique rootService rather than counting the whole response.
+3. Send a sixth ERROR with a new eventId for that same service. After it is consumed, GET again: there must still be only one active incident for that service, with the same id and title. No existing-incident count/severity update is required.
+4. For a **different unique serviceName**, send five WARNING events with distinct eventIds. After consumption, GET again: there must be no incident for that warning-only service. INFO is also ignored by correlation.
+5. Optional: for another unique service, send four ERROR events and one CRITICAL within the window; expect one CRITICAL incident. To check resolution behavior, PATCH the original incident to RESOLVED using the existing status endpoint, then send a fresh ERROR while at least five failures still remain in its window: a new OPEN incident may be created with a new id.
+
+Optional Redis inspection from a PowerShell terminal with the same Compose settings (replace the example service name with the exact value sent):
+
+```powershell
+$serviceName = 'stage5-payment-replace-with-unique-suffix'
+$counterKey = 'errors:{' + $serviceName + '}'
+docker compose exec redis redis-cli ZCARD $counterKey
+docker compose exec redis redis-cli PTTL $counterKey
+docker compose exec redis redis-cli ZCARD "${counterKey}:critical"
+```
+
+These are **sorted-set** keys: use ZCARD, not GET. PTTL is remaining lifetime in milliseconds; -2 means the key has expired or does not exist. Inspect soon after consumption: idle keys expire, so later ZCARD can be 0. Between writes, ZCARD can include aged members until the next pruning operation or key expiry; it is not a separate live-window API.
+
 ## Current boundaries
 
-Events now travel asynchronously through Kafka into incident_events; the existing incident REST API is unchanged. There is no Redis, incident correlation, automatic incident creation, AI/MCP investigation, authentication, pagination, advanced state machine, Gateway, or Kubernetes implementation. No framework versions have been upgraded, and no commits or pushes are made automatically.
+Events travel asynchronously through Kafka into incident_events and qualifying per-service failures now create incidents through transient Redis correlation. The existing incident REST API is unchanged. There is no LLM/AI/MCP investigation, authentication, pagination, advanced state machine, Gateway, or Kubernetes implementation. Existing incidents are not automatically escalated or updated. No framework versions have been upgraded, and no commits or pushes are made automatically.

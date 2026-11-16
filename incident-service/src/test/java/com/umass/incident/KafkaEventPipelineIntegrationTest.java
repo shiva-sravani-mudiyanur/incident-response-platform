@@ -22,6 +22,7 @@ import org.springframework.boot.builder.SpringApplicationBuilder;
 import org.springframework.context.ConfigurableApplicationContext;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.testcontainers.kafka.KafkaContainer;
+import org.testcontainers.containers.GenericContainer;
 import org.testcontainers.postgresql.PostgreSQLContainer;
 import tools.jackson.databind.ObjectMapper;
 import java.nio.charset.StandardCharsets;
@@ -42,6 +43,7 @@ class KafkaEventPipelineIntegrationTest {
     private static final String TOPIC = "service-events";
     private KafkaContainer kafka;
     private PostgreSQLContainer postgres;
+    private GenericContainer<?> redis;
     private Admin admin;
     private KafkaProducer<String, String> producer;
     private ConfigurableApplicationContext application;
@@ -57,6 +59,8 @@ class KafkaEventPipelineIntegrationTest {
                 .withUsername("test_" + UUID.randomUUID().toString().replace("-", ""))
                 .withPassword(UUID.randomUUID().toString());
         postgres.start();
+        redis = new GenericContainer<>("redis:8.2-alpine").withExposedPorts(6379);
+        redis.start();
         admin = Admin.create(Map.of("bootstrap.servers", kafka.getBootstrapServers()));
         admin.createTopics(List.of(new NewTopic(TOPIC, 3, (short) 1))).all().get(20, TimeUnit.SECONDS);
         application = new SpringApplicationBuilder(IncidentServiceApplication.class).run(
@@ -64,6 +68,10 @@ class KafkaEventPipelineIntegrationTest {
                 "--KAFKA_BOOTSTRAP_SERVERS=" + kafka.getBootstrapServers(),
                 "--KAFKA_EVENTS_TOPIC=" + TOPIC,
                 "--KAFKA_CONSUMER_GROUP=incident-processors",
+                "--REDIS_HOST=" + redis.getHost(),
+                "--REDIS_PORT=" + redis.getMappedPort(6379),
+                "--incident.correlation.threshold=5",
+                "--incident.correlation.window-seconds=60",
                 "--DB_HOST=" + postgres.getHost(),
                 "--DB_PORT=" + postgres.getMappedPort(5432),
                 "--DB_NAME=" + postgres.getDatabaseName(),
@@ -93,7 +101,11 @@ class KafkaEventPipelineIntegrationTest {
                     try {
                         if (postgres != null) postgres.stop();
                     } finally {
-                        if (kafka != null) kafka.stop();
+                        try {
+                            if (redis != null) redis.stop();
+                        } finally {
+                            if (kafka != null) kafka.stop();
+                        }
                     }
                 }
             }
@@ -151,6 +163,32 @@ class KafkaEventPipelineIntegrationTest {
 
         assertThat(application.getBean(JdbcTemplate.class).queryForObject(
                 "select count(*) from incident_events where event_id = ?", Integer.class, id)).isEqualTo(1);
+    }
+
+    @Test
+    void fiveKafkaErrorsCreateOneIncidentAndSixthDoesNotDuplicateIt() throws Exception {
+        String service = "kafka-correlation-" + UUID.randomUUID();
+        var jdbc = application.getBean(JdbcTemplate.class);
+        for (int i = 0; i < 5; i++) {
+            var payload = payload(UUID.randomUUID());
+            payload.put("serviceName", service);
+            RecordMetadata sent = producer.send(new ProducerRecord<>(TOPIC, 0, service,
+                    mapper.writeValueAsString(payload))).get(20, TimeUnit.SECONDS);
+            waitForCommit(sent);
+            if (i < 4) assertThat(jdbc.queryForObject("select count(*) from incidents where root_service = ?",
+                    Integer.class, service)).isZero();
+        }
+        var extra = payload(UUID.randomUUID());
+        extra.put("serviceName", service);
+        waitForCommit(producer.send(new ProducerRecord<>(TOPIC, 0, service, mapper.writeValueAsString(extra)))
+                .get(20, TimeUnit.SECONDS));
+
+        assertThat(jdbc.queryForObject("select count(*) from incidents where root_service = ?",
+                Integer.class, service)).isEqualTo(1);
+        assertThat(jdbc.queryForObject("select error_count from incidents where root_service = ?",
+                Integer.class, service)).isEqualTo(5);
+        assertThat(jdbc.queryForObject("select status from incidents where root_service = ?",
+                String.class, service)).isEqualTo("OPEN");
     }
 
     private RecordMetadata publish(UUID id) throws Exception {

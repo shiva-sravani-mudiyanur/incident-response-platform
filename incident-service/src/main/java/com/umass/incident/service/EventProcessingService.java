@@ -18,11 +18,14 @@ public class EventProcessingService {
     private final IncidentEventRepository repository;
     private final Validator validator;
     private final Clock clock;
+    private final CorrelationService correlation;
 
-    public EventProcessingService(IncidentEventRepository repository, Validator validator, Clock clock) {
+    public EventProcessingService(IncidentEventRepository repository, Validator validator, Clock clock,
+                                  CorrelationService correlation) {
         this.repository = repository;
         this.validator = validator;
         this.clock = clock;
+        this.correlation = correlation;
     }
 
     @Transactional
@@ -30,11 +33,14 @@ public class EventProcessingService {
         if (event == null || !validator.validate(event).isEmpty()) {
             throw new InvalidServiceEventException("Consumed event failed validation");
         }
+        // Kafka redelivery must not count an already committed event a second time.
+        if (repository.existsById(event.eventId())) return;
         String logServiceName = event.serviceName().replace('\r', '_').replace('\n', '_');
         log.info("Persisting event eventId={} serviceName={} eventType={} severity={}",
                 event.eventId(), logServiceName, event.eventType(), event.severity());
         repository.save(new IncidentEvent(event.eventId(), event.serviceName(), event.eventType(),
                 event.severity(), event.message(), event.timestamp().truncatedTo(ChronoUnit.MICROS),
                 event.traceId(), clock.instant().truncatedTo(ChronoUnit.MICROS)));
+        correlation.correlate(event);
     }
 }
