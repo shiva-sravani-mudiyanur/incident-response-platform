@@ -23,5 +23,6 @@
         <module>event-service</module>
         <module>service-simulator</module>
         <module>diagnostics-mcp-server</module>
+        <module>ai-analysis-service</module>
     </modules>
 </project>

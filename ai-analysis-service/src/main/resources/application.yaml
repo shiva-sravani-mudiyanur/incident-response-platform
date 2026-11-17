@@ -1,0 +1,60 @@
+spring:
+  application:
+    name: ai-analysis-service
+  autoconfigure:
+    exclude:
+      - org.springframework.ai.model.openai.autoconfigure.OpenAiEmbeddingAutoConfiguration
+      - org.springframework.ai.model.openai.autoconfigure.OpenAiImageAutoConfiguration
+      - org.springframework.ai.model.openai.autoconfigure.OpenAiAudioSpeechAutoConfiguration
+      - org.springframework.ai.model.openai.autoconfigure.OpenAiAudioTranscriptionAutoConfiguration
+      - org.springframework.ai.model.openai.autoconfigure.OpenAiModerationAutoConfiguration
+  ai:
+    model:
+      chat: openai
+    openai:
+      chat:
+        api-key: ${OPENAI_API_KEY:}
+        model: ${OPENAI_MODEL}
+        timeout: ${OPENAI_REQUEST_TIMEOUT:60s}
+        max-retries: 0
+        max-completion-tokens: ${OPENAI_MAX_COMPLETION_TOKENS:2048}
+        store: false
+    mcp:
+      client:
+        # The scoped SDK client is created lazily per analysis, not auto-imported globally.
+        enabled: false
+  jackson:
+    datatype:
+      enum:
+        fail-on-numbers-for-enums: true
+server:
+  address: ${SERVER_ADDRESS:127.0.0.1}
+  port: ${SERVER_PORT:8085}
+  error:
+    include-message: never
+    include-stacktrace: never
+management:
+  endpoints:
+    access:
+      default: none
+    web:
+      discovery:
+        enabled: false
+      exposure:
+        include: health
+    jmx:
+      exposure:
+        exclude: '*'
+  endpoint:
+    health:
+      access: read-only
+      show-details: never
+      show-components: never
+analysis:
+  diagnostics-mcp-base-url: ${DIAGNOSTICS_MCP_BASE_URL}
+  mcp-connect-timeout: ${ANALYSIS_MCP_CONNECT_TIMEOUT:3s}
+  mcp-request-timeout: ${ANALYSIS_MCP_REQUEST_TIMEOUT:15s}
+  max-model-rounds: ${ANALYSIS_MAX_MODEL_ROUNDS:3}
+  max-tool-calls: ${ANALYSIS_MAX_TOOL_CALLS:8}
+  max-evidence-characters: ${ANALYSIS_MAX_EVIDENCE_CHARACTERS:64000}
+  max-model-response-characters: ${ANALYSIS_MAX_MODEL_RESPONSE_CHARACTERS:16000}

@@ -10,8 +10,9 @@ A portfolio-focused distributed incident response platform. The intended system 
 | event-service | 8082 | Validate operational events, assign missing IDs, publish JSON to Kafka, and acknowledge with 202 | Kafka |
 | service-simulator | 8083 | Generate development scenarios through event-service's HTTP API only | event-service over HTTP |
 | diagnostics-mcp-server | 8084 | Read-only MCP diagnostic tools over Streamable HTTP | incident-service over HTTP only |
+| ai-analysis-service | 8085 | Evidence-grounded, read-only incident analysis with a bounded tool loop | diagnostics MCP over Streamable HTTP; OpenAI chat model |
 
-All four modules use Java 21 and Spring Boot 4.0.9, inherited from the root Maven POM. Each runs as its own application in a separate terminal. SERVER_PORT can override its default port. Stage 4 connects event-service and incident-service through Kafka and persists incident_events asynchronously. Stage 5 adds Redis-backed failure correlation and deterministic automatic incident creation without an LLM. Stage 7 adds an HTTP-only scenario generator; it does not implement detection or access Kafka, Redis, PostgreSQL, or the incident API directly. Stage 8 adds operational health/history APIs; Stage 9 exposes five read-only MCP tools backed only by those REST APIs and the existing incident API, without an LLM.
+All five modules use Java 21 and Spring Boot 4.0.9, inherited from the root Maven POM. Each runs as its own application in a separate terminal. SERVER_PORT can override its default port. Stage 4 connects event-service and incident-service through Kafka and persists incident_events asynchronously. Stage 5 adds Redis-backed failure correlation and deterministic automatic incident creation without an LLM. Stage 7 adds an HTTP-only scenario generator; it does not implement detection or access Kafka, Redis, PostgreSQL, or the incident API directly. Stage 8 adds operational health/history APIs; Stage 9 exposes five read-only MCP tools backed only by those REST APIs and the existing incident API. Stage 10 adds a separate OpenAI-backed analysis service that reads diagnostics through MCP only; detection remains deterministic.
 
 ## Stages 1–2: Incident Service and PostgreSQL Persistence
 
@@ -67,6 +68,17 @@ diagnostics-mcp-server/
   src/main/resources/
     application.yaml            Loopback HTTP, STREAMABLE transport, /mcp endpoint
   src/test/java/                Unit/HTTP-client tests and real MCP client/server integration
+ai-analysis-service/
+  pom.xml                       Spring AI OpenAI/MCP clients; opt-in manual-openai profile
+  .env.example                  Blank key/model placeholders and bounded local settings
+  src/main/java/com/umass/analysis/
+    controller/                 Thin POST incident-analysis endpoint
+    service/                    Required diagnostics, bounded model/tool loop, grounding checks
+    mcp/                        Scoped, read-only Streamable HTTP client sessions
+    dto/                        Analysis, confidence, and captured evidence response contracts
+    config/                     Validated analysis budgets and environment configuration
+    exception/                  Sanitized analysis failures
+  src/test/java/                Mock-ChatModel unit/HTTP tests, private MCP fixture, opt-in live IT
 ```
 
 Request flow:
@@ -78,7 +90,7 @@ HTTP -> IncidentController -> IncidentService -> IncidentRepository -> PostgreSQ
 
 JPA entities are never returned from controllers. Creation assigns a UUID, OPEN status, and UTC creation/update timestamps on the server. The caller supplies title, severity, rootService, and errorCount. Timestamp precision is normalized to PostgreSQL microseconds so a creation response matches subsequent retrieval. Status updates preserve identity, creation time, and other incident fields. All three defined statuses are accepted; no transition restrictions are introduced in this stage.
 
-Stage 2 added PostgreSQL persistence; Stage 4 added KRaft Kafka and a topic initializer to Compose; Stage 5 adds transient Redis correlation state. All four Java applications run natively on Windows, not in containers; Compose still runs infrastructure only. Stage 8 exposes operational REST APIs and restricted Actuator health/info/metrics in incident-service. Stage 9 adds a REST-backed MCP server. LLM investigation, Gateway, and Kubernetes remain unimplemented.
+Stage 2 added PostgreSQL persistence; Stage 4 added KRaft Kafka and a topic initializer to Compose; Stage 5 adds transient Redis correlation state. All five Java applications run natively on Windows, not in containers; Compose still runs infrastructure only. Stage 8 exposes operational REST APIs and restricted Actuator health/info/metrics in incident-service. Stage 9 adds a REST-backed MCP server; Stage 10 adds read-only AI analysis. Gateway and Kubernetes remain unimplemented.
 
 ## Prerequisites
 
@@ -804,6 +816,133 @@ These tests need neither Docker, running applications, nor API keys. They exerci
 
 The MCP endpoint is unauthenticated and binds to loopback by default. Its read-only hints describe tool intent; they are not authentication. Use only trusted local clients, treat returned operational text as untrusted data, and add an authentication/network security boundary before any nonlocal deployment. No LLM, autonomous investigation, production authentication, or remote deployment is introduced in Stage 9.
 
+## Stage 10: AI Incident Analysis Service
+
+ai-analysis-service uses Spring AI 2.0.1 and an OpenAI ChatModel to synthesize a grounded incident analysis. Its diagnostic reads go through the Stage 9 Streamable HTTP MCP server only: it has no incident-service REST client, PostgreSQL/Redis/Kafka client, repository, or incident mutation operation. Earlier modules, detection rules, and framework versions are unchanged.
+
+```text
+POST /api/analysis/incidents/{incidentId}
+  -> IncidentAnalysisService -> read-only MCP diagnostics -> incident-service
+  -> bounded OpenAI synthesis / optional diagnostic tool-call rounds
+  -> validated analysis DTO (no persistence or automated remediation)
+```
+
+### Investigation, grounding, and read-only policy
+
+The application requires a canonical incident UUID and obtains get_incident, get_related_events, and get_service_health before invoking the model. Recent errors are retrieved when current errors or incomplete/empty related history make them useful. Missing incidents and mandatory MCP failures stop before any model call. Each analysis uses a separate MCP session and pins its scope to that incident and its rootService. Spring AI supplies MCP support, with its underlying SDK client initialized lazily by the scoped gateway; global client auto-registration is disabled so arbitrary server tools are not imported into the model.
+
+The system instructions require the model to separate **Observed Evidence**, **Probable Cause**, and **Recommendations**; never invent facts; treat incident/event text as untrusted data rather than instructions; and acknowledge uncertainty, time-window differences, and temporal—not causal—event matching. The model can request additional diagnostic reads through a bounded tool-calling loop. Only the five Stage 9 read-only tool names are available; arguments are restricted to the requested incident/root service. Unknown/mutating operations, extra arguments, and cross-incident/service requests are rejected before execution. Recommendations are returned as text, never executed.
+
+The structured response contains:
+
+- incidentId: the requested incident UUID.
+- probableCause: an LLM-generated hypothesis, not a verified root cause.
+- confidence: LOW, MEDIUM, or HIGH; incomplete diagnostic coverage forces LOW.
+- evidence: server-captured observations with IDs, tool names, and tool data. The model references evidence IDs; it cannot author or replace these observed facts. Fabricated or mismatched references cause a failed response, not fake evidence.
+- recommendedActions: proposed human-reviewed next steps, separate from observations.
+- limitations: coverage and interpretation caveats.
+
+Schema and evidence-reference validation do **not** mathematically prove the model's free-text reasoning. Human review is still required. Stage 9 related events remain root-service/time-window matches, and current health can differ from health at the original incident time. No fact is manufactured when diagnostics or model output is unavailable.
+
+### Start in a fifth Windows PowerShell terminal
+
+Keep incident-service (8080), diagnostics-mcp-server (8084), and incident-service's existing infrastructure running. Event-service and the simulator are only needed to generate additional data, not to analyze an existing incident.
+
+OpenAI requests send diagnostic operational data, including selected incident/event text, to OpenAI and may incur charges. Choose an account-accessible Chat Completions model that supports function calling. Model selection is explicit rather than silently choosing a model/cost for you.
+
+```powershell
+cd 'C:\Users\Shiva Sravani\Desktop\incident-response'
+$env:DIAGNOSTICS_MCP_BASE_URL = 'http://127.0.0.1:8084'
+$env:SERVER_ADDRESS = '127.0.0.1'
+$env:SERVER_PORT = '8085'
+$env:OPENAI_MODEL = Read-Host 'OpenAI Chat Completions model ID available to your account'
+$secret = Read-Host 'OpenAI API key (hidden input)' -AsSecureString
+$env:OPENAI_API_KEY = [System.Net.NetworkCredential]::new('', $secret).Password
+Remove-Variable secret
+.\mvnw.cmd -pl ai-analysis-service spring-boot:run
+```
+
+Do not paste a real key into source, README, shell commands/history, screenshots, or chat. Set it only in the launching process/IDE environment. Both root `.env.example` and `ai-analysis-service/.env.example` contain blank credential placeholders; real `.env` files are ignored. As with the other modules, Spring Boot does not automatically load `.env`. Remove the key from the terminal when finished:
+
+```powershell
+Remove-Item Env:OPENAI_API_KEY -ErrorAction SilentlyContinue
+```
+
+Only the AI application's read-only Actuator health endpoint is exposed; sensitive management endpoints and JMX are disabled. Actuator UP does not independently establish MCP availability, OpenAI authorization, billing access, or successful model output.
+
+### Request an analysis in Postman
+
+1. GET `http://localhost:8080/api/incidents` and copy an actual incident id, not a ServiceEvent eventId.
+2. Use POST `http://127.0.0.1:8085/api/analysis/incidents/PASTE_INCIDENT_ID`, no request body.
+3. This request can call the real OpenAI API. A successful result is HTTP 200 with the fields above. Inspect observed evidence and limitations before accepting the probable cause or recommendations.
+
+The AI service handles MCP initialization/session headers internally. Unlike manual Stage 9 calls, this REST endpoint needs no MCP headers or tools/call JSON. No analysis/incident is stored or modified by this request.
+
+| Response | Meaning |
+| --- | --- |
+| 400 | Malformed/shortened incident UUID; no MCP/model call |
+| 404 | Incident not found through MCP; no model call |
+| 503 | MCP/diagnostic evidence or LLM unavailable; sanitized ProblemDetail |
+| 502 | Malformed model output, unsupported evidence references, disallowed tool calls, or exhausted investigation budget |
+
+Errors do not return raw provider responses, credentials, connection details, or stack traces. There is no silent fallback to an invented analysis.
+
+### Diagnose model failures safely
+
+`LLM_UNAVAILABLE` is deliberately generic: it can represent a provider exception, a missing generation, or an empty assistant response. After restarting the AI service and reproducing the request once, inspect its terminal for one of these diagnostic markers:
+
+- `MODEL_CALL_FAILED`: exception class and upstream HTTP status when available; network/client errors can have an unknown status.
+- `MODEL_EMPTY_RESPONSE`: an allowlisted finish reason, `unknown`, or `missing_result`.
+
+These warnings do not include exception messages, stack traces, provider bodies/headers, prompts, credentials, or incident data. Share only the diagnostic marker line when troubleshooting. An accepted API key or an UP health endpoint does not establish that a particular model request succeeds. Do not enable request-body/header wire logging to investigate authentication failures.
+
+### Bounded configuration
+
+| Environment setting | Default / requirement |
+| --- | --- |
+| OPENAI_API_KEY | Required for real OpenAI use; no key default |
+| OPENAI_MODEL | Explicit Chat Completions model ID; no model default |
+| DIAGNOSTICS_MCP_BASE_URL | Required MCP origin only, without /mcp, credentials, query, or fragment |
+| OPENAI_REQUEST_TIMEOUT | 60s per provider request |
+| OPENAI_MAX_COMPLETION_TOKENS | 2048 per model response |
+| ANALYSIS_MCP_CONNECT_TIMEOUT / ANALYSIS_MCP_REQUEST_TIMEOUT | 3s / 15s; positive, at most 60s |
+| ANALYSIS_MAX_MODEL_ROUNDS | 3; permitted 1..5 |
+| ANALYSIS_MAX_TOOL_CALLS | 8 including mandatory preflight; permitted 4..20 |
+| ANALYSIS_MAX_EVIDENCE_CHARACTERS | 64000 total; permitted 1024..256000 |
+| ANALYSIS_MAX_MODEL_RESPONSE_CHARACTERS | 16000; permitted 1024..64000 |
+
+Provider retries are disabled to avoid hidden repeated model charges. Limits bound individual calls/rounds, not a single global HTTP deadline; configure your calling client's timeout accordingly. Oversized evidence is rejected instead of silently clipping facts. These limits and read-only checks are enforced in code, not solely by prompt wording. The API remains unauthenticated and loopback-bound for trusted local development; production authentication, rate limiting, and security controls are not implemented here.
+
+### Automated tests: no real OpenAI requests
+
+```powershell
+.\mvnw.cmd -pl ai-analysis-service test
+.\mvnw.cmd -pl ai-analysis-service clean verify
+```
+
+Unit tests and REST-only integration tests mock ChatModel, disable the OpenAI provider in their HTTP contexts, and need no API key. They cover valid grounded analysis, actual bounded tool continuations, missing incidents, MCP/model outages, structured output validation, unsupported evidence, read-only scope, and the REST response/error mapping. Separate gateway tests exercise the real MCP client against a private local protocol fixture.
+
+OpenAiClientContractTest additionally exercises the real Spring AI/OpenAI SDK against an isolated loopback HTTP fixture with synthetic evidence and an explicit noncredential placeholder. It verifies successful analysis and a tool-call continuation while preserving the configured model, provider endpoint, token limit, storage setting, and tool allowlist. It never contacts OpenAI/OpenRouter or uses a real key. Provider-specific request options are copied from the configured ChatModel; replacing them with generic tool options can cause a ClassCastException in Spring AI 2.0.1 before any provider request.
+
+These tests do not require Docker or your running applications. The complete reactor still needs Docker Desktop for earlier infrastructure tests:
+
+```powershell
+.\mvnw.cmd test
+```
+
+### Opt-in manual integration with real OpenAI
+
+Only this explicitly selected Maven profile runs LiveOpenAiAnalysisIT. It requires OPENAI_API_KEY, OPENAI_MODEL, DIAGNOSTICS_MCP_BASE_URL, and an existing MANUAL_ANALYSIS_INCIDENT_ID. It starts a private AI HTTP listener, but calls your configured real diagnostics server and real OpenAI model. It can transmit operational data and incur charges; **do not run it in normal CI**. No real provider call is required to pass ordinary test/verify.
+
+In a terminal configured with the hidden-input key setup above (without another foreground command), set the incident ID, then run this command only when you intend real calls:
+
+```powershell
+$env:MANUAL_ANALYSIS_INCIDENT_ID = Read-Host 'Existing incident UUID for the live manual test'
+.\mvnw.cmd -pl ai-analysis-service -Pmanual-openai verify
+```
+
+The integration test fails clearly for missing opt-in/required settings rather than silently pretending it called OpenAI. Its live IT naming is excluded from ordinary Surefire execution, with an additional explicit-profile guard. No live OpenAI integration run is claimed by automated verification.
+
 ## Current boundaries
 
-Stage 9 adds a read-only Streamable HTTP diagnostics MCP server backed exclusively by incident-service REST APIs. Stage 8's event-derived health/history and Stage 7's simulator remain unchanged. Events still travel asynchronously through Kafka into incident_events, and qualifying per-service failures create incidents through transient Redis correlation. Existing incident APIs and Stage 6 eventId idempotency are unchanged. Shared scenario traceIds and root-service/time-window diagnostic matches do not implement cross-service incident correlation. There is no LLM-driven investigation, authentication, incident-list pagination, advanced state machine, Gateway, Kubernetes, or application-container deployment implementation. Existing incidents are not automatically escalated or updated. Existing framework versions remain unchanged; Spring AI 2.0.1 is introduced only for MCP support. No commits or pushes are made automatically.
+Stage 10 adds read-only, evidence-referenced OpenAI incident analysis through the existing diagnostics MCP server. Earlier incident APIs, deterministic detection, health/history, simulator, and eventId idempotency remain unchanged. Model output never creates/resolves incidents, changes service state, or executes recommendations. Temporal event matches do not prove root cause or implement cross-service incident correlation. There is no production authentication, incident-list pagination, advanced state machine, Gateway, Kubernetes, or application-container deployment implementation. Existing incidents are not automatically escalated or updated. Existing framework versions remain unchanged; Spring AI 2.0.1 is reused for the new module. No commits or pushes are made automatically.

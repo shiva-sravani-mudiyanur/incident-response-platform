@@ -1,0 +1,5 @@
+# Activated only by the explicitly selected live integration test / manual operator.
+spring:
+  ai:
+    model:
+      chat: openai
