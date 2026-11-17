@@ -8,8 +8,9 @@ A portfolio-focused distributed incident response platform. The intended system 
 | --- | --- | --- | --- |
 | incident-service | 8080 | Manage incidents, persist events, and correlate failures automatically | PostgreSQL, Kafka, Redis |
 | event-service | 8082 | Validate operational events, assign missing IDs, publish JSON to Kafka, and acknowledge with 202 | Kafka |
+| service-simulator | 8083 | Generate development scenarios through event-service's HTTP API only | event-service over HTTP |
 
-Both modules use Java 21 and Spring Boot 4.0.9, inherited from the root Maven POM. Each runs as its own application in a separate terminal. SERVER_PORT can override its default port. Stage 4 connects them through Kafka and persists incident_events asynchronously. Stage 5 adds Redis-backed failure correlation and deterministic automatic incident creation without an LLM.
+All three modules use Java 21 and Spring Boot 4.0.9, inherited from the root Maven POM. Each runs as its own application in a separate terminal. SERVER_PORT can override its default port. Stage 4 connects event-service and incident-service through Kafka and persists incident_events asynchronously. Stage 5 adds Redis-backed failure correlation and deterministic automatic incident creation without an LLM. Stage 7 adds an HTTP-only scenario generator; it does not implement detection or access Kafka, Redis, PostgreSQL, or the incident API directly.
 
 ## Stages 1–2: Incident Service and PostgreSQL Persistence
 
@@ -20,7 +21,7 @@ The Maven parent is named `incident-response-platform`. The existing checkout di
 ```text
 pom.xml                         Maven parent and module list
 docker-compose.yml              PostgreSQL, KRaft Kafka, Redis, and topic initialization
-.env.example                    Optional Compose configuration template; no real password
+.env.example                    Compose and application environment reference; no real password
 incident-service/
   pom.xml                       Service dependencies and executable JAR build
   src/main/java/com/umass/incident/
@@ -49,6 +50,12 @@ event-service/
   src/main/resources/
     application.yaml            Configurable port and strict enum-number handling
   src/test/java/                Service, MockMvc, and real Kafka/HTTP tests
+service-simulator/
+  pom.xml                       HTTP-only scenario generator; no infrastructure clients
+  src/main/java/                Application, simulation API/service, HTTP client, config, delay
+  src/main/resources/
+    application.yaml            Port, required event-service URL, count and timing settings
+  src/test/java/                JUnit 5 unit/controller/config and real HTTP stub tests
 ```
 
 Request flow:
@@ -60,7 +67,7 @@ HTTP -> IncidentController -> IncidentService -> IncidentRepository -> PostgreSQ
 
 JPA entities are never returned from controllers. Creation assigns a UUID, OPEN status, and UTC creation/update timestamps on the server. The caller supplies title, severity, rootService, and errorCount. Timestamp precision is normalized to PostgreSQL microseconds so a creation response matches subsequent retrieval. Status updates preserve identity, creation time, and other incident fields. All three defined statuses are accepted; no transition restrictions are introduced in this stage.
 
-Stage 2 added PostgreSQL persistence; Stage 4 added KRaft Kafka and a topic initializer to Compose; Stage 5 adds transient Redis correlation state. Both Java applications still run natively on Windows, not in containers. AI, MCP, Gateway, and Kubernetes remain unimplemented. Only basic Actuator health is exposed; custom diagnostic APIs belong to a later stage.
+Stage 2 added PostgreSQL persistence; Stage 4 added KRaft Kafka and a topic initializer to Compose; Stage 5 adds transient Redis correlation state. All three Java applications run natively on Windows, not in containers; Compose still runs infrastructure only. AI, MCP, Gateway, and Kubernetes remain unimplemented. Only basic Actuator health is exposed; custom diagnostic APIs belong to a later stage.
 
 ## Prerequisites
 
@@ -115,7 +122,7 @@ The default suite includes:
 - EventProcessingServiceTest and EventConsumerTest: consumer validation, field mapping, processing time, delegation, and propagation of database failures for retry.
 - KafkaEventPipelineIntegrationTest: real Kafka -> production typed listener -> PostgreSQL, V2 migration, ignored Java type headers, malformed/missing/numeric severity rejection without blocking subsequent valid events, and repeated event IDs.
 
-Integration tests start disposable Kafka and/or PostgreSQL Testcontainers and stop them afterward. They use random mapped ports and generated database credentials, never H2 or a developer database/broker. The database-only regression suite disables listener startup; the dedicated Kafka suite exercises the production listener. Tests fail rather than silently skipping when Docker is unavailable. They execute during `mvn test` and `mvn verify`; no Compose startup or application environment variables are required first.
+The infrastructure integration suites start disposable Kafka, PostgreSQL, and/or Redis Testcontainers and stop them afterward. They use random mapped ports and generated database credentials, never H2 or a developer database/broker. The database-only regression suite disables listener startup; the dedicated Kafka suite exercises the production listener. These suites fail rather than silently skipping when Docker is unavailable. They execute during `mvn test` and `mvn verify`; no Compose startup or application environment variables are required first. The simulator's real HTTP stub integration suite does not use Docker; see Stage 7 below.
 
 For an explicitly limited unit/controller run without infrastructure:
 
@@ -186,7 +193,7 @@ Copy-Item .env.example .env
 notepad .env
 ```
 
-Set your own nonempty DB_PASSWORD in .env. Never commit it; .env and .env.* are ignored, while .env.example contains no real password. Docker Compose loads .env, but Spring Boot does not. Set DB_*, KAFKA_BOOTSTRAP_SERVERS, REDIS_HOST, and REDIS_PORT in the incident-service terminal/IDE, plus any correlation overrides shown above. event-service still needs only Kafka configuration, not database or Redis settings. Shell environment values override Compose .env values. Do not share rendered `docker compose config` output because it includes resolved secrets; use `config --quiet`. If changing KAFKA_PORT, also update KAFKA_BOOTSTRAP_SERVERS. If changing REDIS_PORT, use the same published port in incident-service. KAFKA_EVENTS_TOPIC must match between both services and the initializer. Keep KAFKA_CLUSTER_ID unchanged while reusing its volume.
+Set your own nonempty DB_PASSWORD in .env. Never commit it; .env and .env.* are ignored, while .env.example contains no real password. Docker Compose loads .env, but Spring Boot does not: a Compose .env file does not populate Java process environment variables. Set DB_*, KAFKA_BOOTSTRAP_SERVERS, REDIS_HOST, and REDIS_PORT in the incident-service terminal/IDE, plus any correlation overrides shown above. event-service still needs only Kafka configuration, not database or Redis settings. Set EVENT_SERVICE_BASE_URL and any SIMULATOR_* overrides separately in the simulator terminal; the simulator needs no database, Kafka, or Redis variables. Shell environment values override Compose .env values. Do not share rendered `docker compose config` output because it includes resolved secrets; use `config --quiet`. If changing KAFKA_PORT, also update KAFKA_BOOTSTRAP_SERVERS. If changing REDIS_PORT, use the same published port in incident-service. KAFKA_EVENTS_TOPIC must match between event-service, incident-service, and the initializer. Keep KAFKA_CLUSTER_ID unchanged while reusing its volume.
 
 Environment variables belong to the current PowerShell session and its child processes, not every terminal. Close the session or remove password variables when finished.
 
@@ -300,7 +307,7 @@ service-events -> EventConsumer (@KafkaListener, group incident-processors)
                -> IncidentEventRepository -> PostgreSQL incident_events
 ```
 
-Stage 3 introduced validated acceptance. Stage 4 publishes the normalized ServiceEvent as JSON, keyed by serviceName. A 202 confirms broker acknowledgement, not completed database processing or incident creation. A failed/unconfirmed publication returns 503 rather than false acceptance. A timeout can occur after Kafka accepted a record, so retries should reuse a supplied eventId. Stage 5 correlates consumed failures in incident-service; event-service has no Redis dependency. There is still no event retrieval endpoint or inter-service HTTP call.
+Stage 3 introduced validated acceptance. Stage 4 publishes the normalized ServiceEvent as JSON, keyed by serviceName. A 202 confirms broker acknowledgement, not completed database processing or incident creation. A failed/unconfirmed publication returns 503 rather than false acceptance. A timeout can occur after Kafka accepted a record, so retries should reuse a supplied eventId. Stage 5 correlates consumed failures in incident-service; event-service has no Redis dependency. There is still no event retrieval endpoint. Stage 7 adds simulator-to-event-service HTTP calls; event-service and incident-service still communicate through Kafka, not direct HTTP.
 
 ### Run event-service on Windows
 
@@ -390,7 +397,7 @@ Run just the event service/controller unit tests:
 .\mvnw.cmd -pl event-service '-Dtest=EventServiceTest,EventControllerTest,KafkaEventPublisherTest' test
 ```
 
-The root command `.\mvnw.cmd clean verify` builds and tests both services. Compose runs infrastructure only; application containerization is not part of Stage 5.
+The root command `.\mvnw.cmd clean verify` builds and tests all three modules, including the Stage 7 simulator. Docker is required for the earlier infrastructure integration suites, not for simulator tests. Compose runs infrastructure only; application containerization is not part of Stage 7.
 
 ## Stage 4: Kafka delivery and database verification
 
@@ -488,6 +495,97 @@ Focused tests (Docker Desktop required for the integration suites):
 
 Tests cover sequential and concurrent redelivery, PostgreSQL-enforced uniqueness, unchanged original payloads, Redis counter preservation after a duplicate, duplicates after cache expiry, and replay of a threshold-triggering event through the real Kafka listener.
 
+## Stage 7: HTTP-only service simulator
+
+The third Maven module, service-simulator, generates realistic operational event messages for local development. It sends each event to `POST /api/events` on event-service over HTTP. It has no direct Kafka, Redis, PostgreSQL, or incident API access and contains no failure detection or active-incident suppression logic. Those rules remain in incident-service.
+
+```text
+POST /simulate/{scenario} -> service-simulator -> HTTP POST /api/events
+                                             -> event-service -> Kafka
+                                                            -> incident-service
+                                                               -> PostgreSQL / Redis
+```
+
+### Run service-simulator in a third Windows terminal
+
+Start infrastructure and the first two applications using the earlier sections. In a **third Windows PowerShell terminal**, change to the project root and set the simulator's environment explicitly (variables do not carry over from other terminals):
+
+```powershell
+Set-Location 'C:\Users\Shiva Sravani\Desktop\incident-response'
+$env:EVENT_SERVICE_BASE_URL = 'http://localhost:8082'
+$env:SERVER_PORT = '8083'
+.\mvnw.cmd -pl service-simulator spring-boot:run
+```
+
+Keep this terminal open; stop the simulator with Ctrl+C. Use another PowerShell window for requests. If the checkout or service ports differ, adjust the path and URLs accordingly. No DB_*, KAFKA_*, or REDIS_* settings are required in the simulator terminal. For incident verification, incident-service must also be running and consuming; simulator HTTP success alone does not establish that.
+
+| Environment variable | Required/default | Purpose |
+| --- | --- | --- |
+| EVENT_SERVICE_BASE_URL | Required; local example `http://localhost:8082` | Base URL for event-service |
+| SERVER_PORT | Optional; `8083` | Simulator HTTP port |
+| SIMULATOR_FAILURE_EVENT_COUNT | Optional; `5` | Events per failure wave; validated from 1 through 100 |
+| SIMULATOR_CASCADE_DELAY | Optional; `250ms` | Delay between cascade waves; zero is allowed |
+| SIMULATOR_CONNECT_TIMEOUT | Optional; `2s` | Bounded HTTP connection timeout |
+| SIMULATOR_READ_TIMEOUT | Optional; `15s` | Bounded HTTP response timeout |
+
+Set optional overrides with `$env:NAME = 'value'` in the third terminal before startup. The failure count is independent of INCIDENT_CORRELATION_THRESHOLD: changing the simulator count does not change detection rules. The normal scenario always sends three events.
+
+### Trigger scenarios (no request body)
+
+These Windows-compatible commands use **curl.exe**, not Windows PowerShell's `curl` alias. Each POST has **no payload**; `-i` shows the response status and headers:
+
+```powershell
+curl.exe -i -X POST http://localhost:8083/simulate/normal
+curl.exe -i -X POST http://localhost:8083/simulate/database-failure
+curl.exe -i -X POST http://localhost:8083/simulate/payment-failure
+curl.exe -i -X POST http://localhost:8083/simulate/cascade-failure
+```
+
+| Scenario | Events at the default count | Total |
+| --- | --- | --- |
+| normal | One INFO / SERVICE_STARTED for each of order-service, payment-service, and inventory-service | 3 |
+| database-failure | Five ERROR / DATABASE_ERROR events for order-service | 5 |
+| payment-failure | Five ERROR / TIMEOUT events for payment-service | 5 |
+| cascade-failure | Five CRITICAL / DATABASE_ERROR events for order-service, wait 250ms, five ERROR / DEPENDENCY_ERROR events for payment-service, wait 250ms, five ERROR / DEPENDENCY_ERROR events for inventory-service | 15 |
+
+Each scenario invocation creates one UUID traceId shared by all its events, a new UUID eventId for every event, and a timestamp at dispatch. Messages describe the relevant startup, database, timeout, or downstream dependency failure. A cascade sends its waves in the order shown; downstream Kafka consumption is asynchronous and is not a cross-service ordering guarantee.
+
+The endpoints are synchronous: **HTTP 200** is returned only after every upstream POST has received **HTTP 202**. The JSON response contains `scenario`, `traceId`, `eventCount`, and `eventIds`. At the defaults, eventCount is 3, 5, 5, or 15 respectively; retain the returned traceId and IDs for verification. This confirms event-service acknowledgement, not completed consumer processing, database persistence, or incident creation.
+
+An upstream failure or interruption returns **HTTP 502 ProblemDetail** with `scenario`, `traceId`, `acceptedEventCount`, and `acceptedEventIds`. Only confirmed acknowledgements appear in that list; it describes partial progress, not rollback. A timeout can mean an unconfirmed event was accepted upstream. The simulator does **not** automatically retry; rerunning creates a new traceId and new eventIds and is not client-side deduplication. Stage 6 eventId idempotency does not deduplicate a newly generated scenario run.
+
+### Verify consumption and existing incidents
+
+Allow time for asynchronous consumption. In a request terminal, inspect the existing incident API (not a new simulator or event retrieval endpoint):
+
+```powershell
+curl.exe -i 'http://localhost:8080/api/incidents?status=OPEN'
+```
+
+Match `rootService` to order-service, payment-service, or inventory-service, rather than counting all returned incidents. Match the simulator's exact eventIds to `Accepted event` logs in event-service and `Consumed event` logs in incident-service; use the existing Stage 4 database inspection to confirm the same event_id rows and their shared trace_id. The event-service and consumer logs intentionally do not print traceId. The simulator does not query these systems itself.
+
+With the default threshold of five, a fresh qualifying database wave can create a HIGH order-service incident; a payment wave can create a HIGH payment-service incident. With no pre-existing active incidents and clean correlation windows, a cascade can create **up to three per-root-service incidents**: CRITICAL for order-service and HIGH for payment-service and inventory-service. A shared traceId is evidence for inspection, **not implemented cross-service incident correlation**. INFO startup events do not contribute failures.
+
+These scenarios reuse fixed service names. Existing OPEN or INVESTIGATING incidents suppress new automatic incidents for the same rootService. Sending another five errors must not create a duplicate active incident; the existing incident is not automatically updated or escalated. Earlier standalone scenarios can therefore suppress new order/payment incidents during the cascade. Do not expect every rerun to create a new incident: expectations depend on existing incidents, correlation-window state, and the configured threshold. No reset or database deletion is needed for normal verification.
+
+### Simulator tests (no Docker)
+
+Run the focused JUnit 5 unit/controller/configuration/delay tests:
+
+```powershell
+.\mvnw.cmd -pl service-simulator '-Dtest=SimulationServiceTest,EventServiceClientTest,SimulationControllerTest,SimulatorPropertiesTest,SimulationDelayTest' test
+```
+
+Run the entire simulator module, including SimulatorApplicationIntegrationTest using a **real local HTTP stub**, without Docker or running applications:
+
+```powershell
+.\mvnw.cmd -pl service-simulator test
+```
+
+The simulator tests cover scenario payloads and shared/fresh IDs, count/configuration validation, cascade delays, bounded HTTP calls, successful acknowledgement, and partial failure/interruption reporting. They retain JUnit 5 without Spring's JUnit 6 test extension, following the compatibility approach above. They do not prove real Kafka delivery or incident creation. The root `.\mvnw.cmd clean verify` still needs Docker Desktop for the earlier services' infrastructure integration tests.
+
+This unauthenticated simulation HTTP API is for single-instance, localhost development use only. It is not a production deployment or a production load generator. No application service is added to Compose, and this stage adds no authentication, test-fixture/reset API, or automatic retry machinery.
+
 ## Current boundaries
 
-Events travel asynchronously through Kafka into incident_events and qualifying per-service failures now create incidents through transient Redis correlation. The existing incident REST API is unchanged. There is no LLM/AI/MCP investigation, authentication, pagination, advanced state machine, Gateway, or Kubernetes implementation. Existing incidents are not automatically escalated or updated. No framework versions have been upgraded, and no commits or pushes are made automatically.
+Stage 7 adds an HTTP-only local simulator in front of event-service; events still travel asynchronously through Kafka into incident_events and qualifying per-service failures create incidents through transient Redis correlation in incident-service. The existing incident REST API and Stage 6 eventId idempotency are unchanged. Shared scenario traceIds do not implement cross-service incident correlation. There is no LLM/AI/MCP investigation, authentication, pagination, advanced state machine, Gateway, Kubernetes, or application-container deployment implementation. Existing incidents are not automatically escalated or updated. No framework versions have been upgraded, and no commits or pushes are made automatically.

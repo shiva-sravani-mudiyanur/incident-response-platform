@@ -1,0 +1,19 @@
+spring:
+  application:
+    name: service-simulator
+server:
+  port: ${SERVER_PORT:8083}
+  error:
+    include-message: never
+    include-stacktrace: never
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health
+simulator:
+  event-service-base-url: ${EVENT_SERVICE_BASE_URL}
+  failure-event-count: ${SIMULATOR_FAILURE_EVENT_COUNT:5}
+  cascade-delay: ${SIMULATOR_CASCADE_DELAY:250ms}
+  connect-timeout: ${SIMULATOR_CONNECT_TIMEOUT:2s}
+  read-timeout: ${SIMULATOR_READ_TIMEOUT:15s}
