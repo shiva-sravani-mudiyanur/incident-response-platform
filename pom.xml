@@ -22,5 +22,6 @@
         <module>incident-service</module>
         <module>event-service</module>
         <module>service-simulator</module>
+        <module>diagnostics-mcp-server</module>
     </modules>
 </project>

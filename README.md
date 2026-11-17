@@ -9,8 +9,9 @@ A portfolio-focused distributed incident response platform. The intended system 
 | incident-service | 8080 | Manage incidents, persist events, and correlate failures automatically | PostgreSQL, Kafka, Redis |
 | event-service | 8082 | Validate operational events, assign missing IDs, publish JSON to Kafka, and acknowledge with 202 | Kafka |
 | service-simulator | 8083 | Generate development scenarios through event-service's HTTP API only | event-service over HTTP |
+| diagnostics-mcp-server | 8084 | Read-only MCP diagnostic tools over Streamable HTTP | incident-service over HTTP only |
 
-All three modules use Java 21 and Spring Boot 4.0.9, inherited from the root Maven POM. Each runs as its own application in a separate terminal. SERVER_PORT can override its default port. Stage 4 connects event-service and incident-service through Kafka and persists incident_events asynchronously. Stage 5 adds Redis-backed failure correlation and deterministic automatic incident creation without an LLM. Stage 7 adds an HTTP-only scenario generator; it does not implement detection or access Kafka, Redis, PostgreSQL, or the incident API directly.
+All four modules use Java 21 and Spring Boot 4.0.9, inherited from the root Maven POM. Each runs as its own application in a separate terminal. SERVER_PORT can override its default port. Stage 4 connects event-service and incident-service through Kafka and persists incident_events asynchronously. Stage 5 adds Redis-backed failure correlation and deterministic automatic incident creation without an LLM. Stage 7 adds an HTTP-only scenario generator; it does not implement detection or access Kafka, Redis, PostgreSQL, or the incident API directly. Stage 8 adds operational health/history APIs; Stage 9 exposes five read-only MCP tools backed only by those REST APIs and the existing incident API, without an LLM.
 
 ## Stages 1–2: Incident Service and PostgreSQL Persistence
 
@@ -56,6 +57,16 @@ service-simulator/
   src/main/resources/
     application.yaml            Port, required event-service URL, count and timing settings
   src/test/java/                JUnit 5 unit/controller/config and real HTTP stub tests
+diagnostics-mcp-server/
+  pom.xml                       Spring AI 2.0.1 MCP WebMVC starter; no data-store clients
+  src/main/java/com/umass/diagnostics/
+    config/                     Required incident-service origin, HTTP timeouts, scan limits
+    service/                    REST-only diagnostic logic and incident-service client
+    dto/                        Local REST contracts and structured diagnostic results
+    tool/                       Five annotated read-only MCP tools
+  src/main/resources/
+    application.yaml            Loopback HTTP, STREAMABLE transport, /mcp endpoint
+  src/test/java/                Unit/HTTP-client tests and real MCP client/server integration
 ```
 
 Request flow:
@@ -67,7 +78,7 @@ HTTP -> IncidentController -> IncidentService -> IncidentRepository -> PostgreSQ
 
 JPA entities are never returned from controllers. Creation assigns a UUID, OPEN status, and UTC creation/update timestamps on the server. The caller supplies title, severity, rootService, and errorCount. Timestamp precision is normalized to PostgreSQL microseconds so a creation response matches subsequent retrieval. Status updates preserve identity, creation time, and other incident fields. All three defined statuses are accepted; no transition restrictions are introduced in this stage.
 
-Stage 2 added PostgreSQL persistence; Stage 4 added KRaft Kafka and a topic initializer to Compose; Stage 5 adds transient Redis correlation state. All three Java applications run natively on Windows, not in containers; Compose still runs infrastructure only. AI, MCP, Gateway, and Kubernetes remain unimplemented. Only basic Actuator health is exposed; custom diagnostic APIs belong to a later stage.
+Stage 2 added PostgreSQL persistence; Stage 4 added KRaft Kafka and a topic initializer to Compose; Stage 5 adds transient Redis correlation state. All four Java applications run natively on Windows, not in containers; Compose still runs infrastructure only. Stage 8 exposes operational REST APIs and restricted Actuator health/info/metrics in incident-service. Stage 9 adds a REST-backed MCP server. LLM investigation, Gateway, and Kubernetes remain unimplemented.
 
 ## Prerequisites
 
@@ -675,6 +686,124 @@ Real Redis and PostgreSQL/Kafka-backed operational HTTP tests require Docker Des
 .\mvnw.cmd test
 ```
 
+## Stage 9: Diagnostics MCP Server (no LLM)
+
+diagnostics-mcp-server is a separate Spring Boot application using the Spring AI **2.0.1** MCP WebMVC starter with **Streamable HTTP**, not the legacy SSE-only transport. The Spring AI BOM is imported only in this module; Java 21, Spring Boot 4.0.9, and JUnit 5.13.4 remain unchanged. No chat model, LLM provider, API key, database driver, Redis client, or Kafka client is configured in the diagnostics service.
+
+```text
+MCP client -> POST /mcp -> @McpTool adapter -> DiagnosticsService
+          -> IncidentServiceClient -> incident-service REST APIs
+                                    -> existing PostgreSQL/Redis ownership
+```
+
+### Run in a fourth Windows PowerShell terminal
+
+Keep incident-service running with its existing dependencies for live tool results. The diagnostics process needs only the incident-service origin, not its DB/Kafka/Redis credentials:
+
+```powershell
+cd 'C:\Users\Shiva Sravani\Desktop\incident-response'
+$env:INCIDENT_SERVICE_BASE_URL = 'http://localhost:8080'
+$env:SERVER_ADDRESS = '127.0.0.1'
+$env:SERVER_PORT = '8084'
+.\mvnw.cmd -pl diagnostics-mcp-server spring-boot:run
+```
+
+The origin must be absolute HTTP(S), with no credentials, API path, query, or fragment. For example, use `http://localhost:8080`, **not** `http://localhost:8080/api/incidents`. Compose's `.env` does not populate this native Java process. No new Compose service or application container is introduced.
+
+MCP endpoint: `http://127.0.0.1:8084/mcp`. Local server health:
+
+```powershell
+curl.exe -i http://127.0.0.1:8084/actuator/health
+```
+
+This checks the MCP application's health, not upstream availability or successful tool execution. The server can start while incident-service is unavailable; tool calls then report structured errors. Diagnostics Actuator exposure is limited to read-only health, with component details and JMX exposure disabled.
+
+### Available tools and REST boundaries
+
+All five tools use `@McpTool` with required input schemas and read-only, non-destructive, idempotent hints. incidentId must be a full canonical UUID, not an eventId or Java's shortened UUID form. serviceName must be nonblank, at most 100 characters, and safe as one URI path segment. Inputs are validated before any downstream request; tool arguments cannot supply a destination URL.
+
+| MCP tool | Argument | Result / incident-service calls |
+| --- | --- | --- |
+| get_incident | incidentId | Incident DTO from GET /api/incidents/{id} |
+| get_service_health | serviceName | Health DTO from GET /api/services/{name}/health |
+| get_error_frequency | serviceName | Rolling 60-second error count and errors/second derived from that health DTO; no history scan |
+| get_recent_errors | serviceName | ERROR/CRITICAL event DTOs whose processedAt is within the configured recent window; reads paginated GET /api/services/{name}/events |
+| get_related_events | incidentId | Fetches the incident, then scans its rootService history around incident.createdAt; returns root-service/time-window matches |
+
+Related-event matching is explicitly **ROOT_SERVICE_TIME_WINDOW**: by default, 60 seconds before through 60 seconds after the incident's creation, using processedAt. It includes all severities in that interval. It is a diagnostic heuristic, **not proven causality, an incident-event foreign key, or cross-service/trace correlation**. The incident model does not store triggering event IDs. A missing incident stops the lookup without querying unrelated service history.
+
+Recent errors use `(query time - recent window, query time]`, based on historical processedAt rather than the source timestamp. Frequency uses the existing Redis-derived errorsLastMinute field and always declares a 60-second window. These views can differ because of configured windows, clock differences, page limits, concurrent processing, cache restart/warm-up, and the documented PostgreSQL/Redis transaction boundary; no fake equality is imposed.
+
+### Structured success, failures, and bounded scans
+
+Tools return an MCP CallToolResult with JSON `structuredContent` and equivalent JSON text content. The envelope contains `success`, `data`, and `error`. Success has data and a null error. Failure sets MCP `isError=true`, success=false, and an error with a stable code and safe message:
+
+- INVALID_INPUT: invalid/missing UUID or service name; no downstream call.
+- NOT_FOUND: incident-service returned 404.
+- DOWNSTREAM_UNAVAILABLE: connection/timeout or unavailable incident-service.
+- INVALID_DOWNSTREAM_RESPONSE: missing, malformed, or inconsistent upstream data.
+
+Raw upstream response bodies, connection details, and stack traces are not returned as tool errors. A successful HTTP transport response from `/mcp` is not enough: inspect `result.isError` and `result.structuredContent.success`. Malformed MCP protocol requests can instead return protocol-level errors.
+
+History scans are bounded and report scanned pages/events and a `truncated` flag. Defaults inspect at most five pages of 100 rows. If more history exists, truncated=true means relevant events may remain unexamined—even when the returned events array is empty. Do not interpret a partial scan as proof that no matching events exist. Pages are ordered by **source timestamp**, so an old processedAt on one page is not a safe reason to stop early. Results deduplicate event IDs, but pages are not a cross-request database snapshot.
+
+| Environment variable | Default | Scope |
+| --- | --- | --- |
+| DIAGNOSTICS_CONNECT_TIMEOUT | 2s | Per downstream connection; positive, at most 30s |
+| DIAGNOSTICS_READ_TIMEOUT | 5s | Per downstream response; positive, at most 30s |
+| DIAGNOSTICS_HISTORY_PAGE_SIZE | 100 | 1..100 |
+| DIAGNOSTICS_MAX_HISTORY_PAGES | 5 | 1..10 |
+| DIAGNOSTICS_RECENT_ERROR_WINDOW | 60s | Positive, at most one day |
+| DIAGNOSTICS_RELATED_LOOKBACK | 60s | Positive, at most one day |
+| DIAGNOSTICS_RELATED_LOOKAHEAD | 60s | Zero allowed, at most one day |
+| DIAGNOSTICS_MCP_REQUEST_TIMEOUT | 2m | MCP request processing budget |
+
+The MCP client's own timeout must also accommodate the bounded REST requests. If increasing page counts or HTTP timeouts, adjust both client and MCP processing budgets appropriately. Calls are read-only; no automatic retries, incident mutations, or downstream reset actions are added.
+
+### Invoke through an MCP client or Postman
+
+Connect a trusted Streamable HTTP MCP client to `http://127.0.0.1:8084/mcp`, initialize the MCP session, list tools, and call the names above. There are no REST routes such as `/get_incident` or `/api/tools` on this service.
+
+For Postman, use POST `/mcp`, Body > raw > JSON, Content-Type `application/json`, and Accept `application/json, text/event-stream`. First initialize with:
+
+```json
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"postman-check","version":"1.0"}}}
+```
+
+Save the response's `Mcp-Session-Id` header and negotiated protocolVersion. Include `Mcp-Session-Id` and `MCP-Protocol-Version` headers on subsequent requests. Responses can be SSE messages containing JSON-RPC data, not a plain JSON response body. Send the initialized notification (without an id):
+
+```json
+{"jsonrpc":"2.0","method":"notifications/initialized"}
+```
+
+Then list tools and invoke one, using separate POST requests in that same session:
+
+```json
+{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}
+```
+
+```json
+{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"get_service_health","arguments":{"serviceName":"order-service"}}}
+```
+
+For get_incident/get_related_events, obtain an actual incident id using the existing incident-service GET `/api/incidents` API; do not substitute a simulator eventId. Service tools require a known service: first run the normal simulator scenario and wait for consumption if the database has no service history. No LLM is needed to list or invoke tools.
+
+### Stage 9 tests
+
+Run all diagnostics tests, including real Streamable HTTP MCP client/server invocation against a local incident-service HTTP contract stub:
+
+```powershell
+.\mvnw.cmd -pl diagnostics-mcp-server test
+```
+
+These tests need neither Docker, running applications, nor API keys. They exercise actual MCP discovery/invocation, not just Java method calls. The local REST stub does not independently prove live PostgreSQL/Redis behavior; the earlier modules retain their real infrastructure integration tests. Run the full reactor with Docker Desktop ready:
+
+```powershell
+.\mvnw.cmd test
+```
+
+The MCP endpoint is unauthenticated and binds to loopback by default. Its read-only hints describe tool intent; they are not authentication. Use only trusted local clients, treat returned operational text as untrusted data, and add an authentication/network security boundary before any nonlocal deployment. No LLM, autonomous investigation, production authentication, or remote deployment is introduced in Stage 9.
+
 ## Current boundaries
 
-Stage 8 adds event-derived operational health and paginated per-service event history to incident-service. Stage 7's HTTP-only local simulator still feeds event-service; events travel asynchronously through Kafka into incident_events, and qualifying per-service failures create incidents through transient Redis correlation. The existing incident REST API and Stage 6 eventId idempotency are unchanged. Shared scenario traceIds do not implement cross-service incident correlation. There is no LLM/AI/MCP investigation, authentication, incident-list pagination, advanced state machine, Gateway, Kubernetes, or application-container deployment implementation. Existing incidents are not automatically escalated or updated. No framework versions have been upgraded, and no commits or pushes are made automatically.
+Stage 9 adds a read-only Streamable HTTP diagnostics MCP server backed exclusively by incident-service REST APIs. Stage 8's event-derived health/history and Stage 7's simulator remain unchanged. Events still travel asynchronously through Kafka into incident_events, and qualifying per-service failures create incidents through transient Redis correlation. Existing incident APIs and Stage 6 eventId idempotency are unchanged. Shared scenario traceIds and root-service/time-window diagnostic matches do not implement cross-service incident correlation. There is no LLM-driven investigation, authentication, incident-list pagination, advanced state machine, Gateway, Kubernetes, or application-container deployment implementation. Existing incidents are not automatically escalated or updated. Existing framework versions remain unchanged; Spring AI 2.0.1 is introduced only for MCP support. No commits or pushes are made automatically.
