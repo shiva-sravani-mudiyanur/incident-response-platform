@@ -21,6 +21,7 @@ import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.boot.builder.SpringApplicationBuilder;
 import org.springframework.context.ConfigurableApplicationContext;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.data.redis.core.StringRedisTemplate;
 import org.testcontainers.kafka.KafkaContainer;
 import org.testcontainers.containers.GenericContainer;
 import org.testcontainers.postgresql.PostgreSQLContainer;
@@ -157,12 +158,19 @@ class KafkaEventPipelineIntegrationTest {
     @Test
     void repeatedEventIdDoesNotCreateDuplicateRows() throws Exception {
         UUID id = UUID.randomUUID();
-        waitForCommit(publish(id));
+        String service = "kafka-idempotent-" + UUID.randomUUID();
+        var event = payload(id);
+        event.put("serviceName", service);
+        String json = mapper.writeValueAsString(event);
+        var template = application.getBean(StringRedisTemplate.class);
+        waitForCommit(producer.send(new ProducerRecord<>(TOPIC, 0, service, json)).get(20, TimeUnit.SECONDS));
+        assertThat(template.opsForZSet().zCard("errors:{" + service + "}")).isEqualTo(1);
 
-        waitForCommit(publish(id));
+        waitForCommit(producer.send(new ProducerRecord<>(TOPIC, 0, service, json)).get(20, TimeUnit.SECONDS));
 
         assertThat(application.getBean(JdbcTemplate.class).queryForObject(
                 "select count(*) from incident_events where event_id = ?", Integer.class, id)).isEqualTo(1);
+        assertThat(template.opsForZSet().zCard("errors:{" + service + "}")).isEqualTo(1);
     }
 
     @Test
@@ -189,6 +197,30 @@ class KafkaEventPipelineIntegrationTest {
                 Integer.class, service)).isEqualTo(5);
         assertThat(jdbc.queryForObject("select status from incidents where root_service = ?",
                 String.class, service)).isEqualTo("OPEN");
+    }
+
+    @Test
+    void redeliveredThresholdEventDoesNotIncreaseCountersRowsOrIncidents() throws Exception {
+        String service = "kafka-threshold-replay-" + UUID.randomUUID();
+        String fifth = null;
+        for (int i = 0; i < 5; i++) {
+            var event = payload(UUID.randomUUID());
+            event.put("serviceName", service);
+            fifth = mapper.writeValueAsString(event);
+            waitForCommit(producer.send(new ProducerRecord<>(TOPIC, 0, service, fifth)).get(20, TimeUnit.SECONDS));
+        }
+
+        waitForCommit(producer.send(new ProducerRecord<>(TOPIC, 0, service, fifth)).get(20, TimeUnit.SECONDS));
+
+        var jdbc = application.getBean(JdbcTemplate.class);
+        assertThat(jdbc.queryForObject("select count(*) from incident_events where service_name = ?",
+                Integer.class, service)).isEqualTo(5);
+        assertThat(jdbc.queryForObject("select count(*) from incidents where root_service = ?",
+                Integer.class, service)).isEqualTo(1);
+        assertThat(jdbc.queryForObject("select error_count from incidents where root_service = ?",
+                Integer.class, service)).isEqualTo(5);
+        assertThat(application.getBean(StringRedisTemplate.class).opsForZSet().zCard("errors:{" + service + "}"))
+                .isEqualTo(5);
     }
 
     private RecordMetadata publish(UUID id) throws Exception {

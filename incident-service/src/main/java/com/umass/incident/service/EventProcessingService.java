@@ -2,7 +2,6 @@ package com.umass.incident.service;
 
 import com.umass.incident.dto.ServiceEvent;
 import com.umass.incident.exception.InvalidServiceEventException;
-import com.umass.incident.model.IncidentEvent;
 import com.umass.incident.repository.IncidentEventRepository;
 import jakarta.validation.Validator;
 import org.slf4j.Logger;
@@ -33,14 +32,18 @@ public class EventProcessingService {
         if (event == null || !validator.validate(event).isEmpty()) {
             throw new InvalidServiceEventException("Consumed event failed validation");
         }
-        // Kafka redelivery must not count an already committed event a second time.
-        if (repository.existsById(event.eventId())) return;
+        // Atomically claim the eventId in the same transaction as incident creation.
+        // A check followed by save would race with another delivery of the same ID.
+        int inserted = repository.insertIfAbsent(event.eventId(), event.serviceName(), event.eventType().name(),
+                event.severity().name(), event.message(), event.timestamp().truncatedTo(ChronoUnit.MICROS),
+                event.traceId(), clock.instant().truncatedTo(ChronoUnit.MICROS));
+        if (inserted == 0) {
+            log.info("Ignoring duplicate event eventId={}", event.eventId());
+            return;
+        }
         String logServiceName = event.serviceName().replace('\r', '_').replace('\n', '_');
         log.info("Persisting event eventId={} serviceName={} eventType={} severity={}",
                 event.eventId(), logServiceName, event.eventType(), event.severity());
-        repository.save(new IncidentEvent(event.eventId(), event.serviceName(), event.eventType(),
-                event.severity(), event.message(), event.timestamp().truncatedTo(ChronoUnit.MICROS),
-                event.traceId(), clock.instant().truncatedTo(ChronoUnit.MICROS)));
         correlation.correlate(event);
     }
 }

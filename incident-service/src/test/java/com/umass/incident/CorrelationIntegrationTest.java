@@ -21,7 +21,11 @@ import org.junit.jupiter.params.provider.EnumSource;
 import org.springframework.boot.builder.SpringApplicationBuilder;
 import org.springframework.context.ConfigurableApplicationContext;
 import org.springframework.dao.DataAccessException;
+import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.support.TransactionTemplate;
 import org.testcontainers.containers.GenericContainer;
 import org.testcontainers.postgresql.PostgreSQLContainer;
 import java.time.Instant;
@@ -32,6 +36,7 @@ import java.util.UUID;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.CountDownLatch;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -165,10 +170,15 @@ class CorrelationIntegrationTest {
     void persistedRedeliveryDoesNotCountTowardThresholdTwice() {
         String service = serviceName();
         ServiceEvent event = event(service, EventSeverity.ERROR);
-        for (int i = 0; i < 5; i++) processing.process(event);
+        processing.process(event);
+        assertThat(template.opsForZSet().zCard("errors:{" + service + "}")).isEqualTo(1);
+
+        processing.process(event);
 
         assertThat(forService(service)).isEmpty();
         assertThat(template.opsForZSet().zCard("errors:{" + service + "}")).isEqualTo(1);
+        assertThat(application.getBean(JdbcTemplate.class).queryForObject(
+                "select count(*) from incident_events where event_id = ?", Integer.class, event.eventId())).isEqualTo(1);
     }
 
     @Test
@@ -187,6 +197,122 @@ class CorrelationIntegrationTest {
         processing.process(event);
 
         assertThat(application.getBean(IncidentEventRepository.class).existsById(event.eventId())).isTrue();
+    }
+
+    @Test
+    void concurrentDeliveriesOfSameEventAllSucceedWithoutDuplicateEffects() throws Exception {
+        String service = serviceName();
+        ServiceEvent event = event(service, EventSeverity.ERROR);
+        var ready = new CountDownLatch(8);
+        var start = new CountDownLatch(1);
+        var futures = new ArrayList<Future<?>>();
+        try (var executor = Executors.newFixedThreadPool(8)) {
+            for (int i = 0; i < 8; i++) futures.add(executor.submit(() -> {
+                ready.countDown();
+                if (!start.await(10, TimeUnit.SECONDS)) throw new AssertionError("Concurrent deliveries did not start");
+                processing.process(event);
+                return null;
+            }));
+            assertThat(ready.await(10, TimeUnit.SECONDS)).isTrue();
+            start.countDown();
+            for (var future : futures) future.get(20, TimeUnit.SECONDS);
+        }
+
+        assertThat(application.getBean(JdbcTemplate.class).queryForObject(
+                "select count(*) from incident_events where event_id = ?", Integer.class, event.eventId())).isEqualTo(1);
+        assertThat(template.opsForZSet().zCard("errors:{" + service + "}")).isEqualTo(1);
+        assertThat(forService(service)).isEmpty();
+    }
+
+    @Test
+    void duplicateThresholdEventDoesNotReopenAResolvedIncident() {
+        String service = serviceName();
+        for (int i = 0; i < 4; i++) processing.process(event(service, EventSeverity.ERROR));
+        ServiceEvent fifth = event(service, EventSeverity.ERROR);
+        processing.process(fifth);
+        UUID incidentId = forService(service).getFirst().getId();
+        application.getBean(IncidentService.class).updateStatus(incidentId, IncidentStatus.RESOLVED);
+
+        processing.process(fifth);
+
+        assertThat(forService(service)).singleElement().satisfies(incident -> {
+            assertThat(incident.getId()).isEqualTo(incidentId);
+            assertThat(incident.getStatus()).isEqualTo(IncidentStatus.RESOLVED);
+            assertThat(incident.getErrorCount()).isEqualTo(5);
+        });
+        assertThat(template.opsForZSet().zCard("errors:{" + service + "}")).isEqualTo(5);
+    }
+
+    @Test
+    void committedDuplicateDoesNotRecreateAnExpiredRedisCounter() {
+        String service = serviceName();
+        ServiceEvent event = event(service, EventSeverity.ERROR);
+        processing.process(event);
+        String key = "errors:{" + service + "}";
+        template.delete(key);
+
+        processing.process(event);
+
+        assertThat(template.hasKey(key)).isFalse();
+    }
+
+    @Test
+    void reusedEventIdWithChangedPayloadPreservesOriginalRowAndCounters() {
+        String service = serviceName();
+        ServiceEvent original = event(service, EventSeverity.ERROR);
+        processing.process(original);
+        var repository = application.getBean(IncidentEventRepository.class);
+        Instant processedAt = repository.findById(original.eventId()).orElseThrow().getProcessedAt();
+        String other = serviceName();
+        var changed = new ServiceEvent(original.eventId(), other, original.eventType(), EventSeverity.CRITICAL,
+                "Different payload", original.timestamp().plusSeconds(1), "different-trace", Map.of());
+
+        processing.process(changed);
+
+        var stored = repository.findById(original.eventId()).orElseThrow();
+        assertThat(stored.getServiceName()).isEqualTo(service);
+        assertThat(stored.getSeverity()).isEqualTo(EventSeverity.ERROR);
+        assertThat(stored.getMessage()).isEqualTo(original.message());
+        assertThat(stored.getProcessedAt()).isEqualTo(processedAt);
+        assertThat(template.opsForZSet().zCard("errors:{" + service + "}")).isEqualTo(1);
+        assertThat(template.hasKey("errors:{" + other + "}")).isFalse();
+    }
+
+    @Test
+    void postgresPrimaryKeyRejectsDuplicateEventIdEvenOutsideProcessor() {
+        ServiceEvent event = event(serviceName(), EventSeverity.ERROR);
+        processing.process(event);
+        var jdbc = application.getBean(JdbcTemplate.class);
+
+        assertThatThrownBy(() -> jdbc.update(
+                "insert into incident_events select * from incident_events where event_id = ?", event.eventId()))
+                .isInstanceOf(DataIntegrityViolationException.class);
+
+        assertThat(jdbc.queryForObject("select count(*) from incident_events where event_id = ?",
+                Integer.class, event.eventId())).isEqualTo(1);
+    }
+
+    @Test
+    void rollbackAfterRedisUpdateCanRetryWithoutDoubleCountingOrDuplicatingIncident() {
+        String service = serviceName();
+        for (int i = 0; i < 4; i++) processing.process(event(service, EventSeverity.ERROR));
+        ServiceEvent fifth = event(service, EventSeverity.ERROR);
+        var transaction = new TransactionTemplate(application.getBean(PlatformTransactionManager.class));
+        transaction.execute(status -> {
+            processing.process(fifth);
+            status.setRollbackOnly();
+            return null;
+        });
+        assertThat(application.getBean(IncidentEventRepository.class).existsById(fifth.eventId())).isFalse();
+        assertThat(forService(service)).isEmpty();
+        assertThat(template.opsForZSet().zCard("errors:{" + service + "}")).isEqualTo(5);
+
+        processing.process(fifth);
+
+        assertThat(application.getBean(IncidentEventRepository.class).existsById(fifth.eventId())).isTrue();
+        assertThat(template.opsForZSet().zCard("errors:{" + service + "}")).isEqualTo(5);
+        assertThat(forService(service)).singleElement()
+                .satisfies(incident -> assertThat(incident.getErrorCount()).isEqualTo(5));
     }
 
     private List<Incident> forService(String name) {

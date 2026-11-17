@@ -398,7 +398,7 @@ Serialization is configured in KafkaProducerConfiguration/KafkaConsumerConfigura
 
 The incident_events table stores event_id (primary key), service_name, event_type, severity, message, timestamp, nullable trace_id, and processed_at. Source and processing instants use PostgreSQL microsecond precision. Metadata travels in Kafka JSON but is not persisted in this initial table. Stage 4 supplied durable event storage; Stage 5 adds automatic incidents using the correlation rules below.
 
-Consumer auto-commit is disabled. RECORD acknowledgement commits after the transactional processing method returns successfully. Database or Redis failures propagate and retry indefinitely with a configurable interval; they are not intentionally skipped. Invalid DTOs and malformed JSON are logged with topic/partition/offset and skipped so a poison record does not block following valid events. There is no dead-letter topic in this stage. Logs omit raw payload/message/trace/metadata. Stage 5 skips an eventId already committed to incident_events, preserving the stored row and preventing repeated correlation, even after Redis expiry. Redis also deduplicates retried, not-yet-committed events within its window. This is at-least-once processing, not an exactly-once claim or a transactional outbox.
+Consumer auto-commit is disabled. RECORD acknowledgement commits after the transactional processing method returns successfully. Database or Redis failures propagate and retry indefinitely with a configurable interval; they are not intentionally skipped. Invalid DTOs and malformed JSON are logged with topic/partition/offset and skipped so a poison record does not block following valid events. There is no dead-letter topic in this stage. Logs omit raw payload/message/trace/metadata. The processor skips an eventId already committed to incident_events, preserving the stored row and preventing repeated correlation, even after Redis expiry. Stage 6 makes this database decision atomic for concurrent deliveries as well. Redis also deduplicates retried, not-yet-committed events within its window. This is at-least-once processing, not an exactly-once claim or a transactional outbox.
 
 After starting infrastructure and both services, post the event shown above and save the returned eventId. Then:
 
@@ -469,6 +469,24 @@ docker compose exec redis redis-cli ZCARD "${counterKey}:critical"
 ```
 
 These are **sorted-set** keys: use ZCARD, not GET. PTTL is remaining lifetime in milliseconds; -2 means the key has expired or does not exist. Inspect soon after consumption: idle keys expire, so later ZCARD can be 0. Between writes, ZCARD can include aged members until the next pruning operation or key expiry; it is not a separate live-window API.
+
+## Stage 6: Idempotent Kafka event processing
+
+The idempotency key is ServiceEvent.eventId. PostgreSQL already enforces uniqueness through the event_id primary key in V2; no applied migration is changed and no new migration is required.
+
+EventProcessingService validates the event, then performs `INSERT ... ON CONFLICT (event_id) DO NOTHING` through IncidentEventRepository inside the processing transaction. Only an inserted row proceeds to Redis correlation. A duplicate returns normally, logs `Ignoring duplicate event`, and does not change the original event row, Redis counters, or incidents. This replaces the earlier check-then-save race: concurrent deliveries wait for PostgreSQL's uniqueness decision instead of raising avoidable duplicate-key failures. Reusing an ID with different valid payload data still preserves the first committed row; send a new ID for a genuinely new event.
+
+Event persistence and automatic incident creation commit together in PostgreSQL. If processing fails, the insert rolls back and Kafka can retry. Redis's atomic UUID-member deduplication protects retries within the correlation window; the PostgreSQL gate remains effective after Redis expiry or application restart, as long as the stored event row is retained. Redis and PostgreSQL still do not share a distributed atomic transaction; this is not a general exactly-once guarantee across failures, cache loss, or deliberate database deletion.
+
+To verify in Postman, supply one valid eventId and a unique serviceName, then send the same ERROR event twice. Both POSTs can return 202 because event-service publishes both messages; after consumption, expect one incident_events row and Redis ZCARD 1. After four other distinct failures reach the threshold, replaying the threshold-triggering event must leave the count at 5 and must not create another incident. Duplicates are skipped even if the original incident has since been resolved.
+
+Focused tests (Docker Desktop required for the integration suites):
+
+```powershell
+.\mvnw.cmd -pl incident-service '-Dtest=EventProcessingServiceTest,CorrelationIntegrationTest,KafkaEventPipelineIntegrationTest' test
+```
+
+Tests cover sequential and concurrent redelivery, PostgreSQL-enforced uniqueness, unchanged original payloads, Redis counter preservation after a duplicate, duplicates after cache expiry, and replay of a threshold-triggering event through the real Kafka listener.
 
 ## Current boundaries
 

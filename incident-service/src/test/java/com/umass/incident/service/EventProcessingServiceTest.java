@@ -4,7 +4,6 @@ import com.umass.incident.dto.ServiceEvent;
 import com.umass.incident.exception.InvalidServiceEventException;
 import com.umass.incident.model.EventSeverity;
 import com.umass.incident.model.EventType;
-import com.umass.incident.model.IncidentEvent;
 import com.umass.incident.repository.IncidentEventRepository;
 import jakarta.validation.Validation;
 import jakarta.validation.ValidatorFactory;
@@ -15,25 +14,25 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.MethodSource;
-import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.mockito.stubbing.OngoingStubbing;
 import org.springframework.dao.DataAccessResourceFailureException;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneOffset;
+import java.time.temporal.ChronoUnit;
 import java.util.Map;
 import java.util.UUID;
 import java.util.stream.Stream;
 
-import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
-import static org.mockito.Mockito.never;
 
 @ExtendWith(MockitoExtension.class)
 class EventProcessingServiceTest {
@@ -63,20 +62,10 @@ class EventProcessingServiceTest {
     @Test
     void validEventIsMappedAndPersistedWithProcessingTime() {
         ServiceEvent event = event();
+        insert(event).thenReturn(1);
 
         service.process(event);
 
-        var captor = ArgumentCaptor.forClass(IncidentEvent.class);
-        verify(repository).save(captor.capture());
-        IncidentEvent stored = captor.getValue();
-        assertThat(stored.getEventId()).isEqualTo(event.eventId());
-        assertThat(stored.getServiceName()).isEqualTo(event.serviceName());
-        assertThat(stored.getEventType()).isEqualTo(event.eventType());
-        assertThat(stored.getSeverity()).isEqualTo(event.severity());
-        assertThat(stored.getMessage()).isEqualTo(event.message());
-        assertThat(stored.getTimestamp()).isEqualTo(event.timestamp());
-        assertThat(stored.getTraceId()).isEqualTo(event.traceId());
-        assertThat(stored.getProcessedAt()).isEqualTo(NOW);
         verify(correlation).correlate(event);
     }
 
@@ -89,27 +78,47 @@ class EventProcessingServiceTest {
 
     @Test
     void databaseFailurePropagatesSoKafkaCanRetry() {
-        doThrow(new DataAccessResourceFailureException("PostgreSQL unavailable")).when(repository).save(any());
+        ServiceEvent event = event();
+        insert(event).thenThrow(new DataAccessResourceFailureException("PostgreSQL unavailable"));
 
-        assertThatThrownBy(() -> service.process(event())).isInstanceOf(DataAccessResourceFailureException.class);
+        assertThatThrownBy(() -> service.process(event)).isInstanceOf(DataAccessResourceFailureException.class);
+        verifyNoInteractions(correlation);
     }
 
     @Test
     void alreadyPersistedEventIsNotCorrelatedAgainOnRedelivery() {
         ServiceEvent event = event();
-        when(repository.existsById(event.eventId())).thenReturn(true);
+        insert(event).thenReturn(0);
 
         service.process(event);
 
-        verify(repository, never()).save(any());
         verifyNoInteractions(correlation);
     }
 
     @Test
     void correlationFailurePropagatesToRollBackTheEventAndRetry() {
+        ServiceEvent event = event();
+        insert(event).thenReturn(1);
         doThrow(new IllegalStateException("Redis unavailable")).when(correlation).correlate(any());
 
-        assertThatThrownBy(() -> service.process(event())).isInstanceOf(IllegalStateException.class);
+        assertThatThrownBy(() -> service.process(event)).isInstanceOf(IllegalStateException.class);
+    }
+
+    @Test
+    void onlyTheSuccessfulInsertCorrelatesWhenSameEventIsProcessedTwice() {
+        ServiceEvent event = event();
+        insert(event).thenReturn(1, 0);
+
+        service.process(event);
+        service.process(event);
+
+        verify(correlation, times(1)).correlate(event);
+    }
+
+    private OngoingStubbing<Integer> insert(ServiceEvent event) {
+        return when(repository.insertIfAbsent(event.eventId(), event.serviceName(), event.eventType().name(),
+                event.severity().name(), event.message(), event.timestamp().truncatedTo(ChronoUnit.MICROS),
+                event.traceId(), NOW));
     }
 
     private static Stream<ServiceEvent> invalidEvents() {
