@@ -26,6 +26,10 @@ public class RedisFailureCounter {
             end
             redis.call('PEXPIRE', KEYS[1], window)
             redis.call('PEXPIRE', KEYS[2], window)
+            -- Health always means the last minute, not the configurable correlation window.
+            redis.call('ZREMRANGEBYSCORE', KEYS[3], '-inf', now - 60000)
+            redis.call('ZADD', KEYS[3], 'NX', now, ARGV[1])
+            redis.call('PEXPIRE', KEYS[3], 60000)
             return {redis.call('ZCARD', KEYS[1]), redis.call('ZCARD', KEYS[2])}
             """, List.class);
     private final StringRedisTemplate redis;
@@ -38,7 +42,8 @@ public class RedisFailureCounter {
 
     public WindowSnapshot record(ServiceEvent event) {
         String key = "errors:{" + event.serviceName() + "}";
-        List<?> result = redis.execute(RECORD_FAILURE, List.of(key, key + ":critical"),
+        List<?> result = redis.execute(RECORD_FAILURE,
+                List.of(key, key + ":critical", "health-errors:{" + event.serviceName() + "}"),
                 event.eventId().toString(), event.severity() == EventSeverity.CRITICAL ? "1" : "0",
                 Long.toString(windowMillis));
         if (result == null || result.size() != 2) {

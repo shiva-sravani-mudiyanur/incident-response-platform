@@ -41,14 +41,36 @@ server:
     include-stacktrace: never
 management:
   endpoints:
+    access:
+      default: none
     web:
+      discovery:
+        enabled: false
       exposure:
-        include: health
+        include: health,info,metrics
+    jmx:
+      exposure:
+        exclude: '*'
+  endpoint:
+    health:
+      access: read-only
+      show-details: never
+      show-components: never
+    info:
+      access: read-only
+    metrics:
+      access: read-only
+  info:
+    defaults:
+      enabled: false
 app:
   kafka:
     topic: ${KAFKA_EVENTS_TOPIC:service-events}
     retry-interval: ${KAFKA_RETRY_INTERVAL:1s}
 incident:
+  health:
+    degraded-threshold: ${INCIDENT_HEALTH_DEGRADED_THRESHOLD:2}
+    down-threshold: ${INCIDENT_HEALTH_DOWN_THRESHOLD:5}
   correlation:
     threshold: ${INCIDENT_CORRELATION_THRESHOLD:5}
     window-seconds: ${INCIDENT_CORRELATION_WINDOW_SECONDS:60}

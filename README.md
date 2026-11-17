@@ -586,6 +586,95 @@ The simulator tests cover scenario payloads and shared/fresh IDs, count/configur
 
 This unauthenticated simulation HTTP API is for single-instance, localhost development use only. It is not a production deployment or a production load generator. No application service is added to Compose, and this stage adds no authentication, test-fixture/reset API, or automatic retry machinery.
 
+## Stage 8: service health and operational APIs
+
+incident-service now exposes read-only service inventory, derived health, and paginated historical events. Controllers return DTOs, never JPA entities. No new application or infrastructure service is required; restart incident-service with its existing PostgreSQL, Kafka, and Redis environment to load this stage.
+
+### Health configuration and rules
+
+Set optional overrides in the **same PowerShell terminal that starts incident-service**, alongside its existing DB/Kafka/Redis variables:
+
+```powershell
+$env:INCIDENT_HEALTH_DEGRADED_THRESHOLD = '2'
+$env:INCIDENT_HEALTH_DOWN_THRESHOLD = '5'
+.\mvnw.cmd -pl incident-service spring-boot:run
+```
+
+As before, Compose's `.env` does not automatically configure a native Java application. If incident-service is already running, stop that known foreground application with Ctrl+C before restarting it. Do not start another instance on the occupied port.
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| incident.health.degraded-threshold / INCIDENT_HEALTH_DEGRADED_THRESHOLD | 2 | Minimum recent error count for DEGRADED |
+| incident.health.down-threshold / INCIDENT_HEALTH_DOWN_THRESHOLD | 5 | Minimum recent error count for DOWN |
+
+Both thresholds must be positive, and down-threshold must exceed degraded-threshold; invalid configuration fails startup validation. These are independent of incident.correlation.threshold and incident.correlation.window-seconds.
+
+Default rules, in priority order:
+
+1. Any OPEN or INVESTIGATING HIGH/CRITICAL incident for the service means **DOWN**, even with zero recent errors.
+2. Five or more errors in the last minute means **DOWN**.
+3. Two through four means **DEGRADED**.
+4. Zero or one means **HEALTHY**.
+
+Only ERROR and CRITICAL events count. Resolved incidents do not count as active. LOW/MEDIUM active incidents contribute to activeIncidentCount but do not override the error-based status.
+
+This is an event-derived operational assessment, **not an HTTP reachability or heartbeat probe**. An idle known service can be HEALTHY, and an unresolved severe incident keeps it DOWN after its error window expires. lastEventTimestamp is the greatest stored source event timestamp; it is not a last-successful-probe timestamp.
+
+### Read the service APIs
+
+With incident-service running on its default port:
+
+```powershell
+curl.exe -i http://localhost:8080/api/services
+curl.exe -i http://localhost:8080/api/services/order-service/health
+curl.exe -i 'http://localhost:8080/api/services/order-service/events?page=0&size=20'
+```
+
+In Postman, use GET with those same URLs and no request body.
+
+- `/api/services` returns an alphabetically ordered array of health DTOs for distinct service names found in PostgreSQL event history or incident roots. There is no hardcoded three-service registry; before any event/incident exists, the array is empty.
+- `/api/services/{serviceName}/health` returns serviceName, status, errorsLastMinute, activeIncidentCount, and lastEventTimestamp. A service known only from incidents has a null lastEventTimestamp.
+- `/api/services/{serviceName}/events` returns serviceName, events, page, size, totalElements, and totalPages. Each event DTO contains eventId, serviceName, eventType, severity, message, timestamp, traceId, and processedAt. Stored metadata is not added to this response. Events are sorted by source timestamp descending, then processedAt descending, then eventId ascending to break ties.
+- History defaults to page=0 and size=20. Page must be nonnegative and size must be 1..100. Invalid pagination or blank/overlong service names return 400; names are matched literally and case-sensitively. Unknown services return 404 for both health and events. A known service with no events, or a page beyond the end, returns 200 with an empty events array.
+- PostgreSQL/Redis operational query failures return sanitized 503 ProblemDetail responses, not a fabricated HEALTHY result or connection details.
+
+The minute counter is a separate Redis sorted set, `health-errors:{serviceName}`, containing unique eventId members scored with Redis processing time. Eligible event processing updates it atomically alongside the existing Stage 5 correlation keys. Its TTL is 60 seconds after the latest eligible delivery; health reads filter the last minute using Redis server time without changing expiry or the correlation state. This works even when the configurable correlation window is shorter or longer than one minute, and even when no new event arrives to prune old scores. Existing database eventId deduplication and Redis member deduplication still apply.
+
+Recent health state is transient, not PostgreSQL history. It warms from newly processed distinct failures after this upgrade or a Redis restart; historical rows and ignored duplicate deliveries do not rebuild it. Existing active severe incidents still override a zero minute count. The earlier DB/Redis non-atomic-transaction limitations also apply to this additional Redis view.
+
+### Safely exposed Actuator endpoints
+
+```powershell
+curl.exe -i http://localhost:8080/actuator/health
+curl.exe -i http://localhost:8080/actuator/info
+curl.exe -i http://localhost:8080/actuator/metrics
+curl.exe -i http://localhost:8080/actuator/metrics/jvm.memory.used
+```
+
+The existing Actuator dependency is retained. Endpoint access defaults to none, with only health/info/metrics granted read-only access and included in the HTTP allowlist. JMX exposure and the `/actuator` discovery page are disabled. Health component details are hidden; Boot may still advertise nonsensitive liveness/readiness group names. Default info contributors are disabled, so `/actuator/info` returns an empty object rather than environment, build, Git, Java, or OS details.
+
+`/actuator/env`, `/actuator/configprops`, `/actuator/beans`, `/actuator/mappings`, `/actuator/loggers`, `/actuator/heapdump`, `/actuator/threaddump`, and `/actuator/shutdown` are not exposed. No wildcard HTTP exposure is configured. These development APIs remain unauthenticated: keep access on localhost/a trusted private network; this allowlist is not a substitute for production authentication and network controls.
+
+### Verify Stage 8
+
+1. Run the Stage 7 normal scenario once to register all three services through the existing Kafka pipeline. Wait for their matching consumed-event logs, then GET `/api/services` and each service's health/history. INFO events add history but not errors. Existing severe active incidents can still make a service DOWN.
+2. Run the database-failure scenario once. After its events are consumed, inspect order-service health and history; match the returned eventIds to the stored history. With five recent errors and default health thresholds, status is DOWN. The simulator response alone does not prove consumer processing.
+3. Inspect `health-errors:{order-service}` in Redis promptly. Do not confuse it with the configurable correlation key `errors:{order-service}`. After a minute without new qualifying failures, errorsLastMinute falls to zero. If a severe active incident remains, status stays DOWN until that incident is intentionally resolved.
+4. Check the three permitted Actuator endpoints; confirm sensitive routes such as `/actuator/env` and `/actuator/configprops` return 404. Invalid history size=101 returns 400; a never-observed service returns 404.
+
+Focused health/configuration/controller/service unit tests need no Docker:
+
+```powershell
+.\mvnw.cmd -pl incident-service '-Dtest=HealthStatusCalculatorTest,HealthPropertiesTest,ServiceOperationsServiceTest,ServiceControllerTest' test
+```
+
+Real Redis and PostgreSQL/Kafka-backed operational HTTP tests require Docker Desktop, but neither Compose nor your normal applications need to be running. Testcontainers creates separate disposable infrastructure:
+
+```powershell
+.\mvnw.cmd -pl incident-service '-Dtest=RedisFailureCounterIntegrationTest,OperationalEndpointsIntegrationTest' test
+.\mvnw.cmd test
+```
+
 ## Current boundaries
 
-Stage 7 adds an HTTP-only local simulator in front of event-service; events still travel asynchronously through Kafka into incident_events and qualifying per-service failures create incidents through transient Redis correlation in incident-service. The existing incident REST API and Stage 6 eventId idempotency are unchanged. Shared scenario traceIds do not implement cross-service incident correlation. There is no LLM/AI/MCP investigation, authentication, pagination, advanced state machine, Gateway, Kubernetes, or application-container deployment implementation. Existing incidents are not automatically escalated or updated. No framework versions have been upgraded, and no commits or pushes are made automatically.
+Stage 8 adds event-derived operational health and paginated per-service event history to incident-service. Stage 7's HTTP-only local simulator still feeds event-service; events travel asynchronously through Kafka into incident_events, and qualifying per-service failures create incidents through transient Redis correlation. The existing incident REST API and Stage 6 eventId idempotency are unchanged. Shared scenario traceIds do not implement cross-service incident correlation. There is no LLM/AI/MCP investigation, authentication, incident-list pagination, advanced state machine, Gateway, Kubernetes, or application-container deployment implementation. Existing incidents are not automatically escalated or updated. No framework versions have been upgraded, and no commits or pushes are made automatically.

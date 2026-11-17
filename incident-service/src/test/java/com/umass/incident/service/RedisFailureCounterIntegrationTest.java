@@ -96,6 +96,7 @@ class RedisFailureCounterIntegrationTest {
 
         assertThat(template.hasKey(key())).isFalse();
         assertThat(template.hasKey(key() + ":critical")).isFalse();
+        assertThat(new RedisRecentErrors(template).countLastMinute(serviceName)).isEqualTo(1);
         assertThat(counter.record(event(serviceName, EventSeverity.ERROR)).count()).isEqualTo(1);
     }
 
@@ -124,6 +125,45 @@ class RedisFailureCounterIntegrationTest {
         }
 
         assertThat(template.opsForZSet().zCard(key())).isEqualTo(40);
+    }
+
+    @Test
+    void healthMinuteCountsDistinctFailuresIndependentlyOfCorrelationWindow() {
+        var reader = new RedisRecentErrors(template);
+        var failure = event(serviceName, EventSeverity.ERROR);
+        counter.record(failure);
+        counter.record(failure);
+
+        assertThat(reader.countLastMinute(serviceName)).isEqualTo(1);
+        assertThat(reader.countLastMinute("unknown-" + serviceName)).isZero();
+        assertThat(template.getExpire("health-errors:{" + serviceName + "}", TimeUnit.MILLISECONDS))
+                .isBetween(5000L, 60000L);
+    }
+
+    @Test
+    void healthReadsExcludeOldScoresWithoutNewEventsOrRefreshingExpiry() {
+        var reader = new RedisRecentErrors(template);
+        var failure = event(serviceName, EventSeverity.CRITICAL);
+        counter.record(failure);
+        String healthKey = "health-errors:{" + serviceName + "}";
+        double score = template.opsForZSet().score(healthKey, failure.eventId().toString());
+        template.opsForZSet().add(healthKey, failure.eventId().toString(), score - 61000);
+        long before = template.getExpire(healthKey, TimeUnit.MILLISECONDS);
+
+        assertThat(reader.countLastMinute(serviceName)).isZero();
+        assertThat(template.opsForZSet().zCard(healthKey)).isEqualTo(1);
+        assertThat(template.getExpire(healthKey, TimeUnit.MILLISECONDS)).isBetween(1L, before);
+    }
+
+    @Test
+    void healthMinuteDoesNotCountFutureScores() {
+        var failure = event(serviceName, EventSeverity.ERROR);
+        counter.record(failure);
+        String healthKey = "health-errors:{" + serviceName + "}";
+        double score = template.opsForZSet().score(healthKey, failure.eventId().toString());
+        template.opsForZSet().add(healthKey, failure.eventId().toString(), score + 61000);
+
+        assertThat(new RedisRecentErrors(template).countLastMinute(serviceName)).isZero();
     }
 
     private String key() {

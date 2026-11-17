@@ -7,8 +7,24 @@ import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 import java.time.Instant;
 import java.util.UUID;
+import java.util.Optional;
+import java.util.List;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.Pageable;
 
 public interface IncidentEventRepository extends JpaRepository<IncidentEvent, UUID> {
+    boolean existsByServiceName(String serviceName);
+    Optional<IncidentEvent> findFirstByServiceNameOrderByTimestampDescEventIdAsc(String serviceName);
+    Page<IncidentEvent> findByServiceName(String serviceName, Pageable pageable);
+
+    @Query(value = """
+            SELECT service_name FROM incident_events
+            UNION
+            SELECT root_service FROM incidents
+            ORDER BY 1
+            """, nativeQuery = true)
+    List<String> findKnownServiceNames();
+
     // Returns 1 for a new event, 0 for an existing eventId. PostgreSQL resolves
     // concurrent conflicts before correlation runs; never overwrite the original row.
     @Modifying
