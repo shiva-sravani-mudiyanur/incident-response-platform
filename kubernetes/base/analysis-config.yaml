@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: analysis-config
+data:
+  # Optional explicit Secret env overrides this envFrom default when present.
+  SPRING_AI_OPENAI_CHAT_BASE_URL: https://api.openai.com/v1

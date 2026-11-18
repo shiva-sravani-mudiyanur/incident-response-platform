@@ -1,0 +1,11 @@
+# Optional legacy-host compatibility ONLY. Prefer a cgroup-v2 Docker engine.
+# Kubernetes 1.36 defaults to rejecting cgroup v1; never use this override in production.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane
+    kubeadmConfigPatches:
+      - |
+        apiVersion: kubelet.config.k8s.io/v1beta1
+        kind: KubeletConfiguration
+        failCgroupV1: false
