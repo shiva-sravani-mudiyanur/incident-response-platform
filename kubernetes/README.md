@@ -54,7 +54,8 @@ Reuse the Stage 13 Dockerfile; image builds deliberately skip tests, so run regr
 ```powershell
 $apps = @('api-gateway','event-service','incident-service','diagnostics-mcp-server','ai-analysis-service','service-simulator')
 foreach ($app in $apps) {
-    docker build --build-arg "MODULE=$app" --tag "incident-response/${app}:stage14" .
+    $tag = if ($app -eq 'incident-service') { 'stage15' } else { 'stage14' }
+    docker build --build-arg "MODULE=$app" --tag "incident-response/${app}:$tag" .
     if ($LASTEXITCODE -ne 0) { throw "Image build failed: $app" }
 }
 ```
@@ -62,7 +63,10 @@ foreach ($app in $apps) {
 For Kind:
 
 ```powershell
-$images = @($apps | ForEach-Object { "incident-response/${_}:stage14" })
+$images = @($apps | ForEach-Object {
+    $tag = if ($_ -eq 'incident-service') { 'stage15' } else { 'stage14' }
+    "incident-response/${_}:$tag"
+})
 kind load docker-image @images --name incident-response-stage14
 ```
 
@@ -165,6 +169,12 @@ py -m unittest discover -s tests/packaging -p 'test_kubernetes*.py' -v
 ```
 
 The parent verified the actual deployments, every application pod's two probe endpoints, Service DNS, and ready EndpointSlice counts. See [VERIFICATION.md](VERIFICATION.md) for the execution record, replica counts, test results, isolation, and resolved local bootstrap issues. A server-side dry run alone is not evidence that pods became healthy.
+
+## Stage 15: HTTP balancing versus Kafka assignments
+
+Incident-service now exposes read-only `GET /api/instance` with `serviceName`, OS `hostname`, and current UTC `timestamp`. The hostname naturally matches the Kubernetes pod; no load-balancing algorithm or manual pod-name assignment is in the application. Only incident-service advances to image tag `stage15`; other images remain `stage14`. The Service explicitly keeps `sessionAffinity: None` and two incident replicas.
+
+See [the separate load-balancing demo](LOAD_BALANCING.md) for the read-only command, fresh-connection caveat, and the distinct Kafka consumer-group explanation. Do not port-forward incident-service directly to claim Service load balancing: port-forward can pin one pod. The demo uses Service DNS from the gateway pod as a client; it does not add a new gateway route. No events or AI requests are issued.
 
 ## Cleanup boundaries
 

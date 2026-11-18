@@ -15,6 +15,25 @@ A portfolio-focused distributed incident response platform. The intended system 
 
 All six modules use Java 21 and Spring Boot 4.0.9, inherited from the root Maven POM. Each runs as its own application: native mode uses separate terminals, while Stage 13 Compose mode runs them as separate containers. SERVER_PORT can override its default port. Stage 4 connects event-service and incident-service through Kafka and persists incident_events asynchronously. Stage 5 adds Redis-backed failure correlation and deterministic automatic incident creation without an LLM. Stage 7 adds an HTTP-only scenario generator; it does not implement detection or access Kafka, Redis, PostgreSQL, or the incident API directly. Stage 8 adds operational health/history APIs; Stage 9 exposes five read-only MCP tools backed only by those REST APIs and the existing incident API. Stage 10 adds a separate OpenAI-backed analysis service that reads diagnostics through MCP only; detection remains deterministic. Stage 11 adds an optional API gateway on loopback port 8081 as one convenient client entry point; existing services and their internal communication remain independent. Stage 12 adds bounded resilience only to diagnostics REST GETs and scoped AI MCP diagnostic reads, without gateway or model retries.
 
+## Stage 15: demonstrate Kubernetes HTTP balancing
+
+Incident-service exposes read-only `GET /api/instance`, returning `serviceName`, the natural OS `hostname` (the pod name in this Kubernetes deployment), and a fresh UTC `timestamp`. The thin controller returns a DTO with `Cache-Control: no-store`; no load-balancing algorithm or HTTP session state is implemented in Java. Two incident replicas sit behind the existing Kubernetes Service with `sessionAffinity: None`.
+
+Run the bounded, read-only demo through Service DNS, from the gateway pod as an HTTP client:
+
+```powershell
+Set-Location 'C:\Users\Shiva Sravani\Desktop\incident-response'
+$env:KUBECONFIG = Join-Path $env:USERPROFILE '.kube\incident-response-stage14.yaml'
+kubectl -n incident-response rollout status deployment/incident-service --timeout=300s
+powershell.exe -NoProfile -File .\kubernetes\demo-load-balancing.ps1 -Requests 20
+```
+
+Each request starts a separate curl process/new connection to `http://incident-service:8080/api/instance`; the script reports actual responding pod names and counts and requires at least two distinct Ready pod identities. It never chooses a backend itself. Unequal counts are normal; strict round-robin is not promised. Do not port-forward incident-service directly to test distribution, because port-forward can select only one pod. No new `/api/instance` route is added to the gateway; the Service path is the demonstration target.
+
+HTTP connection distribution and Kafka partition assignments are different mechanisms. The former selects a ready HTTP backend; the latter assigns each partition to one consumer within `incident-processors`. With three partitions and two active consumers, ownership can split 2+1, independently of HTTP response counts. No new events, simulation, or provider calls are needed.
+
+See [the full demo and Kafka explanation](kubernetes/LOAD_BALANCING.md) and [actual Stage 15 evidence](kubernetes/STAGE15_VERIFICATION.md). Image build/load instructions in `kubernetes/README.md` now use `stage15` for incident-service only; other applications remain on `stage14`.
+
 ## Stage 14: Kubernetes deployment
 
 The existing six applications can now run in a local Kubernetes namespace using the manifests under `kubernetes/`. Initial replicas are incident-service **2**, event-service **2**, gateway **1**, and the remaining applications **1** each. Internal Kubernetes Services provide DNS discovery; ConfigMaps hold nonsecret settings, and namespaced Secret references supply database/provider credentials without committing their values. Actuator startup/liveness/readiness probes and bounded resource requests/limits are configured.

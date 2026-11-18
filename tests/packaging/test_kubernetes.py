@@ -72,12 +72,15 @@ class KubernetesContractTest(unittest.TestCase):
                 self.assertEqual(spec['replicas'], REPLICAS[name])
                 self.assertEqual(len(pod['containers']), 1)
                 container = pod['containers'][0]
-                self.assertEqual(container['image'], 'incident-response/' + name + ':stage14')
+                tag = 'stage15' if name == 'incident-service' else 'stage14'
+                self.assertEqual(container['image'], 'incident-response/' + name + ':' + tag)
                 self.assertEqual(container['imagePullPolicy'], 'IfNotPresent')
                 self.assertEqual(container['ports'], [{'name': 'http', 'containerPort': port}])
                 self.assertEqual(spec['selector']['matchLabels'], spec['template']['metadata']['labels'])
                 service = services[name]['spec']
                 self.assertEqual(service['type'], 'ClusterIP')
+                if name == 'incident-service':
+                    self.assertEqual(service['sessionAffinity'], 'None')
                 self.assertEqual(service['selector'], spec['selector']['matchLabels'])
                 self.assertEqual(service['ports'], [{'name': 'http', 'port': port, 'targetPort': 'http'}])
         kustomization = load_documents((BASE / 'kustomization.yaml').read_text())[0]
