@@ -1,5 +1,27 @@
 name: incident-response-platform
 
+# Shared runtime hardening. Credentials are supplied only at runtime.
+x-app: &app
+  init: true
+  read_only: true
+  tmpfs:
+    - /tmp:size=128m,mode=1777
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  restart: unless-stopped
+  stop_grace_period: 30s
+  healthcheck:
+    test: ["CMD", "/app/healthcheck.sh"]
+    interval: 10s
+    timeout: 5s
+    retries: 12
+    start_period: 60s
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
 services:
   postgres:
     image: postgres:17-alpine
@@ -74,6 +96,185 @@ services:
       - |
         /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:19092 --create --if-not-exists --topic "$${KAFKA_EVENTS_TOPIC}" --partitions 3 --replication-factor 1
     restart: "no"
+
+  event-service:
+    <<: *app
+    build:
+      context: .
+      args:
+        MODULE: event-service
+    environment:
+      SERVER_ADDRESS: 0.0.0.0
+      SERVER_PORT: "8082"
+      KAFKA_BOOTSTRAP_SERVERS: kafka:19092
+      KAFKA_EVENTS_TOPIC: ${KAFKA_EVENTS_TOPIC:-service-events}
+      KAFKA_PUBLISH_TIMEOUT: ${KAFKA_PUBLISH_TIMEOUT:-5s}
+    ports:
+      - "127.0.0.1:${EVENT_SERVICE_PORT:-8082}:8082"
+    depends_on:
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+
+  incident-service:
+    <<: *app
+    build:
+      context: .
+      args:
+        MODULE: incident-service
+    environment:
+      SERVER_ADDRESS: 0.0.0.0
+      SERVER_PORT: "8080"
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: ${DB_NAME:?Set DB_NAME in your environment or .env}
+      DB_USERNAME: ${DB_USERNAME:?Set DB_USERNAME in your environment or .env}
+      DB_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD in your environment or .env}
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      KAFKA_BOOTSTRAP_SERVERS: kafka:19092
+      KAFKA_EVENTS_TOPIC: ${KAFKA_EVENTS_TOPIC:-service-events}
+      KAFKA_CONSUMER_GROUP: ${KAFKA_CONSUMER_GROUP:-incident-processors}
+      KAFKA_RETRY_INTERVAL: ${KAFKA_RETRY_INTERVAL:-1s}
+      INCIDENT_CORRELATION_THRESHOLD: ${INCIDENT_CORRELATION_THRESHOLD:-5}
+      INCIDENT_CORRELATION_WINDOW_SECONDS: ${INCIDENT_CORRELATION_WINDOW_SECONDS:-60}
+      INCIDENT_HEALTH_DEGRADED_THRESHOLD: ${INCIDENT_HEALTH_DEGRADED_THRESHOLD:-2}
+      INCIDENT_HEALTH_DOWN_THRESHOLD: ${INCIDENT_HEALTH_DOWN_THRESHOLD:-5}
+    ports:
+      - "127.0.0.1:${INCIDENT_SERVICE_PORT:-8080}:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+
+  diagnostics-mcp-server:
+    <<: *app
+    build:
+      context: .
+      args:
+        MODULE: diagnostics-mcp-server
+    environment:
+      SERVER_ADDRESS: 0.0.0.0
+      SERVER_PORT: "8084"
+      INCIDENT_SERVICE_BASE_URL: http://incident-service:8080
+      DIAGNOSTICS_CONNECT_TIMEOUT: ${DIAGNOSTICS_CONNECT_TIMEOUT:-2s}
+      DIAGNOSTICS_READ_TIMEOUT: ${DIAGNOSTICS_READ_TIMEOUT:-5s}
+      DIAGNOSTICS_HISTORY_PAGE_SIZE: ${DIAGNOSTICS_HISTORY_PAGE_SIZE:-100}
+      DIAGNOSTICS_MAX_HISTORY_PAGES: ${DIAGNOSTICS_MAX_HISTORY_PAGES:-5}
+      DIAGNOSTICS_RECENT_ERROR_WINDOW: ${DIAGNOSTICS_RECENT_ERROR_WINDOW:-60s}
+      DIAGNOSTICS_RELATED_LOOKBACK: ${DIAGNOSTICS_RELATED_LOOKBACK:-60s}
+      DIAGNOSTICS_RELATED_LOOKAHEAD: ${DIAGNOSTICS_RELATED_LOOKAHEAD:-60s}
+      DIAGNOSTICS_MCP_REQUEST_TIMEOUT: ${DIAGNOSTICS_MCP_REQUEST_TIMEOUT:-2m}
+      DIAGNOSTICS_RESILIENCE_OPERATION_TIMEOUT: ${DIAGNOSTICS_RESILIENCE_OPERATION_TIMEOUT:-8s}
+      DIAGNOSTICS_RESILIENCE_MAX_ATTEMPTS: ${DIAGNOSTICS_RESILIENCE_MAX_ATTEMPTS:-2}
+      DIAGNOSTICS_RESILIENCE_RETRY_DELAY: ${DIAGNOSTICS_RESILIENCE_RETRY_DELAY:-100ms}
+      DIAGNOSTICS_RESILIENCE_SLIDING_WINDOW_SIZE: ${DIAGNOSTICS_RESILIENCE_SLIDING_WINDOW_SIZE:-10}
+      DIAGNOSTICS_RESILIENCE_MINIMUM_NUMBER_OF_CALLS: ${DIAGNOSTICS_RESILIENCE_MINIMUM_NUMBER_OF_CALLS:-5}
+      DIAGNOSTICS_RESILIENCE_FAILURE_RATE_THRESHOLD: ${DIAGNOSTICS_RESILIENCE_FAILURE_RATE_THRESHOLD:-50}
+      DIAGNOSTICS_RESILIENCE_WAIT_DURATION_IN_OPEN_STATE: ${DIAGNOSTICS_RESILIENCE_WAIT_DURATION_IN_OPEN_STATE:-10s}
+      DIAGNOSTICS_RESILIENCE_PERMITTED_CALLS_IN_HALF_OPEN_STATE: ${DIAGNOSTICS_RESILIENCE_PERMITTED_CALLS_IN_HALF_OPEN_STATE:-1}
+      DIAGNOSTICS_RESILIENCE_MAX_CONCURRENT_CALLS: ${DIAGNOSTICS_RESILIENCE_MAX_CONCURRENT_CALLS:-4}
+    ports:
+      - "127.0.0.1:${DIAGNOSTICS_MCP_PORT:-8084}:8084"
+    depends_on:
+      incident-service:
+        condition: service_healthy
+
+  ai-analysis-service:
+    <<: *app
+    build:
+      context: .
+      args:
+        MODULE: ai-analysis-service
+    # Validate without printing credential values; exec preserves Java signals.
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - ': "$${OPENAI_API_KEY:?Supply OPENAI_API_KEY externally}"; : "$${OPENAI_MODEL:?Supply OPENAI_MODEL externally}"; exec java -Djava.io.tmpdir=/tmp -jar /app/app.jar'
+    environment:
+      SERVER_ADDRESS: 0.0.0.0
+      SERVER_PORT: "8085"
+      DIAGNOSTICS_MCP_BASE_URL: http://diagnostics-mcp-server:8084
+      # Empty values keep infrastructure-only commands usable without a key.
+      # A complete AI startup requires externally supplied credentials/model.
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-}
+      SPRING_AI_OPENAI_CHAT_BASE_URL: ${SPRING_AI_OPENAI_CHAT_BASE_URL:-https://api.openai.com/v1}
+      OPENAI_REQUEST_TIMEOUT: ${OPENAI_REQUEST_TIMEOUT:-60s}
+      OPENAI_MAX_COMPLETION_TOKENS: ${OPENAI_MAX_COMPLETION_TOKENS:-2048}
+      ANALYSIS_MCP_CONNECT_TIMEOUT: ${ANALYSIS_MCP_CONNECT_TIMEOUT:-3s}
+      ANALYSIS_MCP_REQUEST_TIMEOUT: ${ANALYSIS_MCP_REQUEST_TIMEOUT:-15s}
+      ANALYSIS_MAX_MODEL_ROUNDS: ${ANALYSIS_MAX_MODEL_ROUNDS:-3}
+      ANALYSIS_MAX_TOOL_CALLS: ${ANALYSIS_MAX_TOOL_CALLS:-8}
+      ANALYSIS_MAX_EVIDENCE_CHARACTERS: ${ANALYSIS_MAX_EVIDENCE_CHARACTERS:-64000}
+      ANALYSIS_MAX_MODEL_RESPONSE_CHARACTERS: ${ANALYSIS_MAX_MODEL_RESPONSE_CHARACTERS:-16000}
+      ANALYSIS_RESILIENCE_OPERATION_TIMEOUT: ${ANALYSIS_RESILIENCE_OPERATION_TIMEOUT:-20s}
+      ANALYSIS_RESILIENCE_MAX_ATTEMPTS: ${ANALYSIS_RESILIENCE_MAX_ATTEMPTS:-2}
+      ANALYSIS_RESILIENCE_RETRY_DELAY: ${ANALYSIS_RESILIENCE_RETRY_DELAY:-100ms}
+      ANALYSIS_RESILIENCE_SLIDING_WINDOW_SIZE: ${ANALYSIS_RESILIENCE_SLIDING_WINDOW_SIZE:-10}
+      ANALYSIS_RESILIENCE_MINIMUM_NUMBER_OF_CALLS: ${ANALYSIS_RESILIENCE_MINIMUM_NUMBER_OF_CALLS:-5}
+      ANALYSIS_RESILIENCE_FAILURE_RATE_THRESHOLD: ${ANALYSIS_RESILIENCE_FAILURE_RATE_THRESHOLD:-50}
+      ANALYSIS_RESILIENCE_WAIT_DURATION_IN_OPEN_STATE: ${ANALYSIS_RESILIENCE_WAIT_DURATION_IN_OPEN_STATE:-10s}
+      ANALYSIS_RESILIENCE_PERMITTED_CALLS_IN_HALF_OPEN_STATE: ${ANALYSIS_RESILIENCE_PERMITTED_CALLS_IN_HALF_OPEN_STATE:-1}
+      ANALYSIS_RESILIENCE_MAX_CONCURRENT_CALLS: ${ANALYSIS_RESILIENCE_MAX_CONCURRENT_CALLS:-4}
+    ports:
+      - "127.0.0.1:${AI_ANALYSIS_PORT:-8085}:8085"
+    depends_on:
+      diagnostics-mcp-server:
+        condition: service_healthy
+
+  service-simulator:
+    <<: *app
+    build:
+      context: .
+      args:
+        MODULE: service-simulator
+    environment:
+      SERVER_ADDRESS: 0.0.0.0
+      SERVER_PORT: "8083"
+      EVENT_SERVICE_BASE_URL: http://event-service:8082
+      SIMULATOR_FAILURE_EVENT_COUNT: ${SIMULATOR_FAILURE_EVENT_COUNT:-5}
+      SIMULATOR_CASCADE_DELAY: ${SIMULATOR_CASCADE_DELAY:-250ms}
+      SIMULATOR_CONNECT_TIMEOUT: ${SIMULATOR_CONNECT_TIMEOUT:-2s}
+      SIMULATOR_READ_TIMEOUT: ${SIMULATOR_READ_TIMEOUT:-15s}
+    ports:
+      - "127.0.0.1:${SIMULATOR_PORT:-8083}:8083"
+    depends_on:
+      event-service:
+        condition: service_healthy
+
+  api-gateway:
+    <<: *app
+    build:
+      context: .
+      args:
+        MODULE: api-gateway
+    environment:
+      SERVER_ADDRESS: 0.0.0.0
+      SERVER_PORT: "8081"
+      GATEWAY_EVENT_SERVICE_URL: http://event-service:8082
+      GATEWAY_INCIDENT_SERVICE_URL: http://incident-service:8080
+      GATEWAY_ANALYSIS_SERVICE_URL: http://ai-analysis-service:8085
+      GATEWAY_SIMULATOR_URL: http://service-simulator:8083
+      GATEWAY_CONNECT_TIMEOUT_MS: ${GATEWAY_CONNECT_TIMEOUT_MS:-2000}
+      GATEWAY_RESPONSE_TIMEOUT: ${GATEWAY_RESPONSE_TIMEOUT:-5m}
+    ports:
+      - "127.0.0.1:${GATEWAY_PORT:-8081}:8081"
+    depends_on:
+      event-service:
+        condition: service_healthy
+      incident-service:
+        condition: service_healthy
+      ai-analysis-service:
+        condition: service_healthy
+      service-simulator:
+        condition: service_healthy
 
 volumes:
   postgres_data:

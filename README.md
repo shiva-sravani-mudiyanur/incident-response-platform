@@ -13,7 +13,11 @@ A portfolio-focused distributed incident response platform. The intended system 
 | ai-analysis-service | 8085 | Evidence-grounded, read-only incident analysis with a bounded tool loop | diagnostics MCP over Streamable HTTP; OpenAI chat model |
 | api-gateway | 8081 | Config-driven HTTP entry point for event, incident, service, analysis, and simulation APIs | Selected downstream services over HTTP only |
 
-All six modules use Java 21 and Spring Boot 4.0.9, inherited from the root Maven POM. Each runs as its own application in a separate terminal. SERVER_PORT can override its default port. Stage 4 connects event-service and incident-service through Kafka and persists incident_events asynchronously. Stage 5 adds Redis-backed failure correlation and deterministic automatic incident creation without an LLM. Stage 7 adds an HTTP-only scenario generator; it does not implement detection or access Kafka, Redis, PostgreSQL, or the incident API directly. Stage 8 adds operational health/history APIs; Stage 9 exposes five read-only MCP tools backed only by those REST APIs and the existing incident API. Stage 10 adds a separate OpenAI-backed analysis service that reads diagnostics through MCP only; detection remains deterministic. Stage 11 adds an optional API gateway on loopback port 8081 as one convenient client entry point; existing services and their internal communication remain independent. Stage 12 adds bounded resilience only to diagnostics REST GETs and scoped AI MCP diagnostic reads, without gateway or model retries.
+All six modules use Java 21 and Spring Boot 4.0.9, inherited from the root Maven POM. Each runs as its own application: native mode uses separate terminals, while Stage 13 Compose mode runs them as separate containers. SERVER_PORT can override its default port. Stage 4 connects event-service and incident-service through Kafka and persists incident_events asynchronously. Stage 5 adds Redis-backed failure correlation and deterministic automatic incident creation without an LLM. Stage 7 adds an HTTP-only scenario generator; it does not implement detection or access Kafka, Redis, PostgreSQL, or the incident API directly. Stage 8 adds operational health/history APIs; Stage 9 exposes five read-only MCP tools backed only by those REST APIs and the existing incident API. Stage 10 adds a separate OpenAI-backed analysis service that reads diagnostics through MCP only; detection remains deterministic. Stage 11 adds an optional API gateway on loopback port 8081 as one convenient client entry point; existing services and their internal communication remain independent. Stage 12 adds bounded resilience only to diagnostics REST GETs and scoped AI MCP diagnostic reads, without gateway or model retries.
+
+## Stage 13 quick start: complete Docker stack
+
+The six applications and PostgreSQL, Redis, Kafka, and one-shot topic initialization now run with `docker compose up --build`. See [Stage 13: Docker packaging](#stage-13-docker-packaging) below for credentials, port conflicts, readiness, and the repeatable end-to-end smoke. Native Java startup remains supported; do not run both modes on the same host ports or point two incident consumers at the same broker unintentionally.
 
 ## Stages 1–2: Incident Service and PostgreSQL Persistence
 
@@ -23,7 +27,11 @@ The Maven parent is named `incident-response-platform`. The existing checkout di
 
 ```text
 pom.xml                         Maven parent and module list
-docker-compose.yml              PostgreSQL, KRaft Kafka, Redis, and topic initialization
+docker-compose.yml              Full six-application stack plus PostgreSQL, Kafka, Redis, topic init
+Dockerfile                      Shared Java 21 multi-stage build selected by MODULE
+.dockerignore                   Allowlisted source context; no credentials or local builds
+docker/healthcheck.sh            Bounded container-local Actuator probe
+scripts/smoke-docker.ps1         Explicit synthetic pipeline smoke; real AI is opt-in
 .env.example                    Compose and application environment reference; no real password
 incident-service/
   pom.xml                       Service dependencies and executable JAR build
@@ -1102,6 +1110,144 @@ These are verification commands, not a claim of test execution or results. No re
 
 Optional manual outage observation is for a user-chosen development session only: stop **only the known incident-service or diagnostics MCP application with Ctrl+C in its own terminal**. Do not kill unrelated processes, stop infrastructure, or clear data. A stopped incident-service can be observed through the existing read-only MCP calls without an LLM; an analysis POST may incur model charges if diagnostics recovers, so it is not a harmless probe. Restart the stopped application with its earlier environment. After the circuit wait, a successful permitted probe restores calls; session reconnection may also be needed. Health UP alone still does not prove downstream recovery.
 
+## Stage 13: Docker packaging
+
+One command builds and starts all six applications, PostgreSQL, Redis, Kafka, and a one-shot `kafka-init` container:
+
+```powershell
+docker compose up --build
+```
+
+### Prerequisites and credentials
+
+Use Docker Desktop in Linux-container mode with a current Docker Compose v2 plugin. The image build supplies Maven and Java 21; neither a host JDK nor host-built JARs are needed to start the stack. Initial builds download base images and Maven dependencies and take longer than cached builds. Run host Maven tests separately before treating an image as verified.
+
+From Windows PowerShell:
+
+```powershell
+Set-Location 'C:\Users\Shiva Sravani\Desktop\incident-response'
+if (-not (Test-Path -LiteralPath '.env')) {
+    Copy-Item -LiteralPath '.env.example' -Destination '.env'
+}
+notepad.exe .env
+```
+
+In the local ignored `.env`, set `DB_NAME`, `DB_USERNAME`, `DB_PASSWORD`, `OPENAI_API_KEY`, and `OPENAI_MODEL`. Use your **existing database values** if reusing the existing PostgreSQL volume: editing environment variables does not change credentials in an initialized database. Do not delete a volume or repair Flyway just to fix a connection/configuration issue.
+
+For an OpenAI-compatible provider such as OpenRouter, also set `SPRING_AI_OPENAI_CHAT_BASE_URL=https://openrouter.ai/api/v1`; the default is `https://api.openai.com/v1`. Use a key and model issued/supported by the selected provider. Keep real keys out of this README, `.env.example`, shell command history, build arguments, and chat. The key/model reach only the AI container at runtime; no real provider call occurs merely from starting the stack. A real analysis sends incident evidence to that provider and can incur charges. The AI container refuses empty key/model settings before starting Java.
+
+Compose reads `.env` for these container settings. The older native Java launch instructions still require PowerShell/IDE environment variables; Spring Boot does not automatically load `.env`. Shell variables take precedence over `.env`, so do not leave stale provider or port overrides in the control terminal. Use `docker compose config --quiet` to validate without printing credentials; plain `docker compose config`, container inspect output, or environment dumps can reveal runtime secrets to a local Docker administrator.
+
+### Ports and networking
+
+Before default-port startup, stop only your recognized native application processes with Ctrl+C in their own terminals, or change the published host ports below. Do not stop unrelated processes. Existing infrastructure containers in this same default Compose project can be reused; a second project needs distinct host infrastructure ports as well.
+
+| Host-port variable | Default host port | Container port |
+| --- | --- | --- |
+| `INCIDENT_SERVICE_PORT` | 8080 | 8080 |
+| `GATEWAY_PORT` | 8081 | 8081 |
+| `EVENT_SERVICE_PORT` | 8082 | 8082 |
+| `SIMULATOR_PORT` | 8083 | 8083 |
+| `DIAGNOSTICS_MCP_PORT` | 8084 | 8084 |
+| `AI_ANALYSIS_PORT` | 8085 | 8085 |
+| `DB_PORT` | required; template 5433 | 5432 |
+| `KAFKA_PORT` | 9092 | 9092 (external listener) |
+| `REDIS_PORT` | 6379 | 6379 |
+
+Every published port binds only to `127.0.0.1`. Applications listen on `0.0.0.0` **inside their own containers** so other containers can reach them. Compose explicitly replaces the native URL examples with Docker DNS addresses, not host loopback:
+
+```text
+client -> api-gateway:8081
+  /api/events/**    -> event-service:8082 -> kafka:19092
+  /api/incidents/** -> incident-service:8080 -> postgres:5432 / redis:6379
+  /api/services/**  -> incident-service:8080
+  /api/analysis/**  -> ai-analysis-service:8085 -> diagnostics-mcp-server:8084/mcp
+                                             -> incident-service:8080
+  /simulate/**     -> service-simulator:8083 -> event-service:8082
+```
+
+The Kafka consumer also connects to `kafka:19092`. `localhost` in the broker's **external** advertised listener is for native host clients only; its INTERNAL advertised listener is `kafka:19092`. Loopback Actuator probes run inside the very container they check and are not container-to-container traffic. Host port overrides never change internal URLs or the incident application's internal DB/Redis ports.
+
+### Build, readiness, and shutdown
+
+The shared root `Dockerfile` selects one module through `MODULE`, compiles it in a digest-pinned Maven/Java 21 stage, and copies only the executable JAR into a digest-pinned Java 21 JRE stage. It runs as UID/GID 10001, without Maven/source/test files in the final image. The allowlisted build context excludes local targets, Git metadata, credentials, and private-key files. Dependency downloads use a BuildKit cache. Image assembly skips tests deliberately; this is not evidence that tests passed.
+
+Compose adds an init process, read-only application root filesystems, writable bounded `/tmp`, dropped Linux capabilities, no-new-privileges, bounded application logs, and graceful shutdown. Java receives termination signals. The bounded curl health helper checks container-local `/actuator/health`; it accepts only HTTP 200 and does not retry or follow redirects.
+
+Applications wait for declared healthy dependencies. Event/incident services also wait for `kafka-init` to finish topic creation successfully. PostgreSQL/Redis/Kafka have their own health checks. These conditions order startup; they are not ongoing dependency supervision. Existing Stage 12 controls handle read-boundary outages after startup. Health UP does not prove model-provider availability or successful evidence synthesis.
+
+For a detached startup with a bounded readiness wait, use this equivalent form:
+
+```powershell
+docker compose config --quiet
+docker compose up --build -d --wait --wait-timeout 300
+docker compose ps --all
+Invoke-RestMethod 'http://127.0.0.1:8081/actuator/health'
+```
+
+Expect nine long-running healthy containers and `kafka-init` exited with code 0, not a continuously running initializer. Existing PostgreSQL and Kafka named volumes are preserved. Redis intentionally retains the earlier ephemeral rolling-window policy; correlation counters are not a durable incident database.
+
+```powershell
+docker compose logs --tail 100 incident-service
+docker compose logs --tail 100 ai-analysis-service
+# Stops/removes this project's containers/network; preserves named data volumes.
+docker compose down
+```
+
+Do not add `--volumes`/`-v` unless you deliberately intend to destroy that project's PostgreSQL/Kafka data. Do not post raw logs or configuration output containing credentials. This is a hardened local portfolio deployment, not an internet-ready HA platform: authentication/TLS, production secret management, backups, broker replication, and resource sizing remain deployment responsibilities.
+
+### Full synthetic pipeline smoke
+
+`scripts/smoke-docker.ps1` uses the existing simulator endpoint, not invented request parameters. Its database-failure scenario targets `order-service` and supplies its own fresh trace and event IDs. To prove a **new** correlated incident, use a clean, dedicated Compose project. The script must fail rather than resolve existing incidents, reset counters, or pretend that duplicate suppression created a new incident. A second creation smoke may need a fresh project; keep previous artifacts for audit.
+
+Against a ready, clean default-port stack, run the complete check:
+
+```powershell
+# Complete requested path: explicit consent to ONE analysis HTTP POST.
+# The analysis service can make multiple bounded model rounds; no POST is retried.
+powershell.exe -NoProfile -File .\scripts\smoke-docker.ps1 -IncludeAi
+```
+
+Alternatively, omit `-IncludeAi` for pipeline-only verification without a provider call. Choose one mode on a fresh project rather than running both consecutively on the same active `order-service` incident. A pipeline-only run does **not** prove AI analysis passed. The full check reads back simulator acknowledgements, persisted REST history, matching Kafka records through a separate diagnostic consumer, Redis rolling-window members, and the newly created incident; it then validates a real analysis response's captured tool evidence, incident/service/event identities, probable cause, confidence, and recommended actions. It does not claim to semantically verify every sentence of model prose. Incident DTOs do not expose a direct event foreign key; creation is established by clean-run isolation, new ID, service/count/time, and correlated event identities—not an invented `lastEventId` field.
+
+For isolated testing while native applications keep their ports, choose a fresh project and free host ports. The following example assumes the shown alternate ports are free and the earlier database/provider settings are already configured in `.env`:
+
+```powershell
+$env:COMPOSE_PROJECT_NAME = 'incident-response-smoke-' + [Guid]::NewGuid().ToString('N')
+$env:DB_PORT = '25433'
+$env:KAFKA_PORT = '29092'
+$env:REDIS_PORT = '26379'
+$env:INCIDENT_SERVICE_PORT = '28080'
+$env:GATEWAY_PORT = '28081'
+$env:EVENT_SERVICE_PORT = '28082'
+$env:SIMULATOR_PORT = '28083'
+$env:DIAGNOSTICS_MCP_PORT = '28084'
+$env:AI_ANALYSIS_PORT = '28085'
+docker compose up --build -d --wait --wait-timeout 300
+if ($LASTEXITCODE -ne 0) { throw 'Isolated stack startup failed; do not run smoke.' }
+& .\scripts\smoke-docker.ps1 -Gateway 'http://127.0.0.1:28081' -ProjectName $env:COMPOSE_PROJECT_NAME -IncludeAi
+```
+
+Use this same project selection for subsequent `docker compose ps`, `logs`, or `down`; do not accidentally operate on your default project. Environment overrides above live only in this terminal. The script's `-EnvFile` accepts an array of explicit files when needed; later files override earlier ones, without printing their contents. Match `-ExpectedEventCount` and `-ExpectedThreshold` to nondefault simulator/correlation settings. The script refuses an unrelated native gateway even if it is healthy.
+
+Read polling and native commands have finite limits. Simulation and AI POSTs are each issued once. Provider failure, incomplete Kafka scan, expired Redis evidence, wrong IDs, or invalid AI output fail the command; they are not silently skipped or replaced with fabricated data. A provider error may require selecting an available model before manually starting another explicitly authorized smoke. Real provider calls are not part of the default automated suite.
+
+### Regression commands
+
+```powershell
+$env:JAVA_HOME = 'C:\Program Files\Java\jdk-21'
+.\mvnw.cmd -B -ntp test
+# Python 3 plus Docker Compose CLI; synthetic env fixture, no user .env reads.
+py -m unittest discover -s tests/packaging -p test_compose.py -v
+# Offline smoke-script contracts using the installed Windows Pester module.
+$result = Invoke-Pester -Script .\scripts\tests\smoke-docker.Tests.ps1 -PassThru
+if ($result.FailedCount -gt 0) { throw 'Smoke-script contract tests failed.' }
+```
+
+The Dockerfile/health-helper behavior checks additionally require a POSIX shell and curl (run them in a suitable development/CI environment with `python -m unittest discover -s tests/packaging -p test_dockerfile.py -v`). Runtime health checks always execute inside Linux application containers, so a Windows host does not need its own shell/curl for normal Compose startup. No Kubernetes, framework upgrades, new detection behavior, provider retries, commits, or pushes are introduced by this stage.
+
+The actual completed build, test, container readiness, and real-provider smoke evidence is recorded in [Stage 13 verification](docs/stage13-verification.md), including synthetic incident/trace IDs and the isolated project's ports. This is an execution record, not fabricated sample output.
+
 ## Current boundaries
 
-Stage 10 adds read-only, evidence-referenced OpenAI incident analysis through the existing diagnostics MCP server. Stage 11 adds only a config-driven HTTP gateway; existing services remain independently accessible and its no-Retry policy is unchanged. Stage 12 adds bounded retries, time limits, and per-process circuit breakers only for diagnostics REST GETs and scoped AI MCP diagnostic reads. No global analysis/model/gateway retry, authentication, rate limiting, or discovery is added. Earlier incident APIs, deterministic detection, health/history, simulator, eventId idempotency, and Kafka/Redis/database policies remain unchanged. Model output never creates/resolves incidents, changes service state, or executes recommendations. Temporal event matches do not prove root cause or implement cross-service incident correlation. There is no production authentication, incident-list pagination, advanced state machine, Kubernetes, or application-container deployment implementation. Existing incidents are not automatically escalated or updated. Java 21, Spring Boot 4.0.9, and JUnit 5.13.4 remain unchanged; Spring AI 2.0.1 remains scoped to the earlier AI/MCP modules. Spring Cloud 2025.1.4 is imported locally by api-gateway and, for Stage 12 resilience, diagnostics-mcp-server and ai-analysis-service—not by the root parent. No commits or pushes are made automatically.
+Stage 10 adds read-only, evidence-referenced OpenAI incident analysis through the existing diagnostics MCP server. Stage 11 adds only a config-driven HTTP gateway; existing services remain independently accessible and its no-Retry policy is unchanged. Stage 12 adds bounded retries, time limits, and per-process circuit breakers only for diagnostics REST GETs and scoped AI MCP diagnostic reads. Stage 13 packages the existing six applications and infrastructure in Docker Compose with runtime configuration, health checks, and an explicit synthetic smoke script. No global analysis/model/gateway retry, authentication, rate limiting, or discovery is added. Earlier incident APIs, deterministic detection, health/history, simulator, eventId idempotency, and Kafka/Redis/database policies remain unchanged. Model output never creates/resolves incidents, changes service state, or executes recommendations. Temporal event matches do not prove root cause or implement cross-service incident correlation. There is no production authentication, incident-list pagination, advanced state machine, or Kubernetes deployment. Existing incidents are not automatically escalated or updated. Java 21, Spring Boot 4.0.9, and JUnit 5.13.4 remain unchanged; Spring AI 2.0.1 remains scoped to the earlier AI/MCP modules. Spring Cloud 2025.1.4 is imported locally by api-gateway and, for Stage 12 resilience, diagnostics-mcp-server and ai-analysis-service—not by the root parent. No commits or pushes are made automatically.
