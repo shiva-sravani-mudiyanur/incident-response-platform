@@ -22,10 +22,13 @@ class IncidentServiceClientTest {
         """;
     MockRestServiceServer server;
     IncidentServiceClient client;
+    TestReadPolicy policy;
+    @org.junit.jupiter.api.AfterEach void closePolicy() { policy.close(); }
     @BeforeEach void setup() {
+        policy = new TestReadPolicy();
         RestClient.Builder builder = RestClient.builder().baseUrl("http://incident.test");
         server = MockRestServiceServer.bindTo(builder).build();
-        client = new IncidentServiceClient(builder.build());
+        client = new IncidentServiceClient(builder.build(), policy.policy);
     }
     @Test void retrievesHealthAndEncodesTheLiteralServiceSegment() {
         String name = "orders ?#%&=";
@@ -89,11 +92,11 @@ class IncidentServiceClientTest {
         assertEquals("orders", result.rootService());
         server.verify();
     }
-    @ParameterizedTest @ValueSource(ints={404,429,500,503,400,302})
+    @ParameterizedTest @ValueSource(ints={404,408,429,500,502,503,504,501,400,401,403,302})
     void httpErrorsUseSafeStructuredCodes(int status) {
-        server.expect(anything()).andRespond(withStatus(HttpStatus.valueOf(status)).body("secret upstream URL/password"));
+        server.expect(org.springframework.test.web.client.ExpectedCount.times(java.util.Set.of(408,429,500,502,503,504).contains(status) ? 2 : 1), anything()).andRespond(withStatus(HttpStatus.valueOf(status)).body("secret upstream URL/password"));
         var error = assertThrows(DiagnosticException.class, () -> client.getIncident(ID));
-        assertEquals(status == 404 ? "NOT_FOUND" : status == 429 || status >= 500 ? "DOWNSTREAM_UNAVAILABLE" : "INVALID_DOWNSTREAM_RESPONSE", error.code());
+        assertEquals(status == 404 ? "NOT_FOUND" : status == 408 || status == 429 || status >= 500 ? "DOWNSTREAM_UNAVAILABLE" : "INVALID_DOWNSTREAM_RESPONSE", error.code());
         assertFalse(error.getMessage().contains("secret"));
         assertFalse(error.getMessage().contains("http"));
         server.verify();
@@ -105,16 +108,41 @@ class IncidentServiceClientTest {
         org.mockito.Mockito.when(response.getStatusCode()).thenReturn(HttpStatus.OK);
         org.mockito.Mockito.when(response.getHeaders()).thenReturn(headers);
         org.mockito.Mockito.when(response.getBody()).thenThrow(new java.net.SocketTimeoutException("secret upstream address"));
-        server.expect(anything()).andRespond(request -> response);
+        server.expect(org.springframework.test.web.client.ExpectedCount.times(2), anything()).andRespond(request -> response);
         var error = assertThrows(DiagnosticException.class, () -> client.getIncident(ID));
         assertEquals("DOWNSTREAM_UNAVAILABLE", error.code());
         assertFalse(error.getMessage().contains("secret"));
+        server.verify();
     }
+    @Test void plainTransportIoWhileOpeningBodyCanRecoverOnFreshGet() throws Exception {
+        var response = org.mockito.Mockito.mock(org.springframework.http.client.ClientHttpResponse.class);
+        var headers = new org.springframework.http.HttpHeaders();
+        headers.setContentType(MediaType.APPLICATION_JSON);
+        org.mockito.Mockito.when(response.getStatusCode()).thenReturn(HttpStatus.OK);
+        org.mockito.Mockito.when(response.getHeaders()).thenReturn(headers);
+        org.mockito.Mockito.when(response.getBody()).thenThrow(new IOException("secret transport reset"));
+        server.expect(anything()).andRespond(request -> response);
+        server.expect(anything()).andRespond(withSuccess(INCIDENT, MediaType.APPLICATION_JSON));
+        assertEquals(ID, client.getIncident(ID).id());
+        server.verify();
+    }
+
+    @Test void interruptedTransportIsNeverRetriedAndRestoresInterrupt() {
+        server.expect(anything()).andRespond(withException(new java.io.InterruptedIOException("secret cancelled")));
+        try {
+            var error = assertThrows(DiagnosticException.class, () -> client.getIncident(ID));
+            assertEquals("DOWNSTREAM_UNAVAILABLE", error.code());
+            assertTrue(Thread.currentThread().isInterrupted());
+            server.verify();
+        } finally { Thread.interrupted(); }
+    }
+
     @Test void connectionFailureIsUnavailableAndDoesNotLeakDetails() {
-        server.expect(anything()).andRespond(withException(new IOException("secret http://internal")));
+        server.expect(org.springframework.test.web.client.ExpectedCount.times(2), anything()).andRespond(withException(new IOException("secret http://internal")));
         var error = assertThrows(DiagnosticException.class, () -> client.getIncident(ID));
         assertEquals("DOWNSTREAM_UNAVAILABLE", error.code());
         assertFalse(error.getMessage().contains("internal"));
+        server.verify();
     }
     @ParameterizedTest @ValueSource(strings={"", "{}", "[]", "null", "{bad", "{\"id\":\"1-1-1-1-1\"}"})
     void malformedOrIncompleteIncidentIsNotSuccessful(String body) {

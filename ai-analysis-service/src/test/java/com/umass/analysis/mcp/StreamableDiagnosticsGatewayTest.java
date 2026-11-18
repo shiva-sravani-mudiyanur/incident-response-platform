@@ -25,11 +25,18 @@ class StreamableDiagnosticsGatewayTest {
     private final List<String> toolCalls = new java.util.concurrent.CopyOnWriteArrayList<>();
     private HttpServer server;
     private DiagnosticsGateway gateway;
+    private java.util.concurrent.ExecutorService resilienceExecutor;
+    private java.util.concurrent.ExecutorService fixtureExecutor;
+    private final java.util.concurrent.atomic.AtomicInteger initializations = new java.util.concurrent.atomic.AtomicInteger();
+    private volatile long initializeDelayMillis;
+    private volatile long firstToolDelayMillis;
     private volatile String mode = "normal";
 
     @BeforeEach
     void startPrivateMcpFixture() throws Exception {
         server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        fixtureExecutor = java.util.concurrent.Executors.newFixedThreadPool(4);
+        server.setExecutor(fixtureExecutor);
         server.createContext("/mcp", exchange -> {
             if (exchange.getRequestMethod().equals("DELETE")) {
                 exchange.sendResponseHeaders(200, -1);
@@ -45,6 +52,8 @@ class StreamableDiagnosticsGatewayTest {
             }
             Object result;
             if (method.equals("initialize")) {
+                initializations.incrementAndGet();
+                pause(initializeDelayMillis);
                 exchange.getResponseHeaders().set("Mcp-Session-Id", "private-test-session");
                 result = Map.of("protocolVersion", "2025-11-25", "capabilities", Map.of("tools", Map.of("listChanged", false)),
                         "serverInfo", Map.of("name", "diagnostics-mcp-server", "version", "0.0.1"));
@@ -62,6 +71,7 @@ class StreamableDiagnosticsGatewayTest {
                 Map<?, ?> params = (Map<?, ?>) request.get("params");
                 String name = (String) params.get("name");
                 toolCalls.add(name);
+                if (toolCalls.size() == 1) pause(firstToolDelayMillis);
                 Map<String, Object> envelope;
                 boolean error = mode.equals("missing") || mode.equals("unavailable");
                 if (error) {
@@ -84,15 +94,58 @@ class StreamableDiagnosticsGatewayTest {
             try (var output = exchange.getResponseBody()) { output.write(body); }
         });
         server.start();
+        configureGateway(Duration.ofSeconds(5), Map.of());
+    }
+
+    private void configureGateway(Duration requestTimeout, Map<String, Object> overrides) {
+        if (resilienceExecutor != null) resilienceExecutor.shutdownNow();
         var properties = new AnalysisProperties(java.net.URI.create("http://127.0.0.1:" + server.getAddress().getPort()),
-                Duration.ofSeconds(2), Duration.ofSeconds(5), 3, 8, 64000, 16000);
-        gateway = (DiagnosticsGateway) Class.forName("com.umass.analysis.mcp.StreamableDiagnosticsGateway")
-                .getConstructor(AnalysisProperties.class, ObjectMapper.class).newInstance(properties, mapper);
+                Duration.ofSeconds(2), requestTimeout, 3, 8, 64000, 16000);
+        var values = new java.util.HashMap<String, Object>();
+        overrides.forEach((key, value) -> values.put("analysis.resilience." + key, value));
+        var resilienceProperties = new org.springframework.boot.context.properties.bind.Binder(
+                new org.springframework.boot.context.properties.source.MapConfigurationPropertySource(values))
+                .bindOrCreate("analysis.resilience", com.umass.analysis.resilience.McpResilienceProperties.class);
+        var configuration = new com.umass.analysis.resilience.McpResilienceConfiguration();
+        resilienceExecutor = configuration.mcpReadExecutor(resilienceProperties);
+        var factory = new org.springframework.cloud.circuitbreaker.resilience4j.Resilience4JCircuitBreakerFactory(
+                io.github.resilience4j.circuitbreaker.CircuitBreakerRegistry.ofDefaults(),
+                io.github.resilience4j.timelimiter.TimeLimiterRegistry.ofDefaults(), null);
+        configuration.mcpCircuitCustomizer(resilienceProperties, resilienceExecutor).customize(factory);
+        gateway = new StreamableDiagnosticsGateway(properties, mapper,
+                new com.umass.analysis.resilience.McpReadResilience(factory, resilienceProperties));
     }
 
     @AfterEach
     void stopPrivateFixture() {
         if (server != null) server.stop(0);
+        if (fixtureExecutor != null) fixtureExecutor.shutdownNow();
+        if (resilienceExecutor != null) resilienceExecutor.shutdownNow();
+    }
+
+    private static void pause(long milliseconds) {
+        try { Thread.sleep(milliseconds); } catch (InterruptedException exception) { Thread.currentThread().interrupt(); }
+    }
+
+    @Test void retriesTimedOutReadWithoutReinitializingOrChangingScope() {
+        configureGateway(Duration.ofMillis(500), Map.of("operation-timeout", "2s", "retry-delay", "0ms"));
+        firstToolDelayMillis = 900;
+        try (var session = gateway.open(incidentId)) {
+            assertThat(session.call("get_incident", Map.of("incidentId", incidentId))).containsEntry("id", incidentId);
+        }
+        assertThat(toolCalls).containsExactly("get_incident", "get_incident");
+        assertThat(initializations).hasValue(1);
+    }
+
+    @Test void overallDeadlineBoundsSlowInitializationAndDoesNotReplayHandshake() {
+        configureGateway(Duration.ofSeconds(5), Map.of("operation-timeout", "200ms"));
+        initializeDelayMillis = 2000;
+        long started = System.nanoTime();
+        assertThatThrownBy(() -> gateway.open(incidentId)).isInstanceOfSatisfying(AnalysisException.class,
+                error -> assertThat(error.status().value()).isEqualTo(503));
+        assertThat(Duration.ofNanos(System.nanoTime() - started)).isLessThan(Duration.ofSeconds(2));
+        assertThat(initializations).hasValue(1);
+        assertThat(toolCalls).isEmpty();
     }
 
     @Test

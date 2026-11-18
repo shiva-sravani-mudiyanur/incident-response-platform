@@ -13,7 +13,7 @@ A portfolio-focused distributed incident response platform. The intended system 
 | ai-analysis-service | 8085 | Evidence-grounded, read-only incident analysis with a bounded tool loop | diagnostics MCP over Streamable HTTP; OpenAI chat model |
 | api-gateway | 8081 | Config-driven HTTP entry point for event, incident, service, analysis, and simulation APIs | Selected downstream services over HTTP only |
 
-All six modules use Java 21 and Spring Boot 4.0.9, inherited from the root Maven POM. Each runs as its own application in a separate terminal. SERVER_PORT can override its default port. Stage 4 connects event-service and incident-service through Kafka and persists incident_events asynchronously. Stage 5 adds Redis-backed failure correlation and deterministic automatic incident creation without an LLM. Stage 7 adds an HTTP-only scenario generator; it does not implement detection or access Kafka, Redis, PostgreSQL, or the incident API directly. Stage 8 adds operational health/history APIs; Stage 9 exposes five read-only MCP tools backed only by those REST APIs and the existing incident API. Stage 10 adds a separate OpenAI-backed analysis service that reads diagnostics through MCP only; detection remains deterministic. Stage 11 adds an optional API gateway on loopback port 8081 as one convenient client entry point; existing services and their internal communication remain independent.
+All six modules use Java 21 and Spring Boot 4.0.9, inherited from the root Maven POM. Each runs as its own application in a separate terminal. SERVER_PORT can override its default port. Stage 4 connects event-service and incident-service through Kafka and persists incident_events asynchronously. Stage 5 adds Redis-backed failure correlation and deterministic automatic incident creation without an LLM. Stage 7 adds an HTTP-only scenario generator; it does not implement detection or access Kafka, Redis, PostgreSQL, or the incident API directly. Stage 8 adds operational health/history APIs; Stage 9 exposes five read-only MCP tools backed only by those REST APIs and the existing incident API. Stage 10 adds a separate OpenAI-backed analysis service that reads diagnostics through MCP only; detection remains deterministic. Stage 11 adds an optional API gateway on loopback port 8081 as one convenient client entry point; existing services and their internal communication remain independent. Stage 12 adds bounded resilience only to diagnostics REST GETs and scoped AI MCP diagnostic reads, without gateway or model retries.
 
 ## Stages 1–2: Incident Service and PostgreSQL Persistence
 
@@ -1037,6 +1037,71 @@ Gateway tests use private loopback downstream HTTP stubs, not your running appli
 
 No Compose application service or infrastructure change is introduced. This unauthenticated gateway is for trusted local development; binding it to loopback does not secure existing downstream listeners. Production authentication, network controls, and deployment remain outside Stage 11.
 
+## Stage 12: Bounded diagnostic-read resilience
+
+Stage 12 adds Spring Cloud CircuitBreaker and Resilience4j **only at two read boundaries**. The Spring Cloud BOM **2025.1.4** is imported locally by diagnostics-mcp-server and ai-analysis-service, matching the gateway's existing BOM. It resolves Spring Cloud CircuitBreaker **5.0.3** and Resilience4j **2.3.0**. Java 21, Spring Boot 4.0.9, JUnit 5.13.4, and Spring AI 2.0.1 stay pinned. No root-wide Spring Cloud BOM or infrastructure change is introduced. This section supersedes the Stage 9 no-automatic-retry description only for the diagnostic reads below; Stage 11's gateway no-Retry policy remains unchanged.
+
+| Process / named circuit | Protected work | Retry policy |
+| --- | --- | --- |
+| diagnostics-mcp-server / `incident-service-read` | One incident-service REST GET, including one history page | Transient I/O and HTTP 408, 429, 500, 502, 503, 504 only; a fresh HTTP request on every attempt |
+| ai-analysis-service / `diagnosticsMcpReads` | Scoped calls to the five static Stage 9 read-only tools | Typed transient I/O/timeout failures only; no retry of a valid MCP tool-error envelope |
+
+Although MCP uses HTTP POST, these five allowlisted tools are semantically read-only: `get_incident`, `get_service_health`, `get_error_frequency`, `get_recent_errors`, and `get_related_events`. This does **not** authorize retrying arbitrary POSTs. Scope, canonical UUID, allowlist, and tool-budget checks run before resilience. MCP SDK 2 does not preserve typed raw HTTP 5xx status in this path: those failures return a controlled error, not a guessed retry based on raw message text. A valid MCP tool-error envelope is not retried, even if it reports downstream unavailability; this avoids multiplying incident-service GET retries.
+
+Domain 404s, application-payload validation failures, and authentication/authorization errors are not retried and do not count as availability failures. A malformed MCP transport/protocol response can still count as an unavailable dependency; its raw text is never used to guess whether to retry. Retries never restart a whole history scan, diagnostic tool on the diagnostics server, analysis request, or model round. There are no new retries for event publication, simulator writes, gateway routes, or model/provider calls, and no Kafka, Redis, or database policy changes. Provider retries remain disabled: no hidden repeated paid model calls.
+
+### Deadlines, concurrency, and circuit states
+
+Each process has its own in-memory circuit; state is not shared across applications or persisted. CircuitBreaker surrounds Retry, and a TimeLimiter bounds the **full logical operation**, including attempts and backoff. The default is **two total attempts (one retry)** with a fixed 100ms delay. Execution uses an explicit fixed executor (four workers by default) with **zero queue**; excess work fails in a controlled way rather than accumulating. Spring Cloud bulkhead autowrapping is disabled so it does not add another executor or queue.
+
+- **CLOSED:** calls are allowed. A count-based window keeps the last ten logical call outcomes; at least five recorded calls are needed before a failure rate of 50% or more opens the circuit. Individual retry attempts are not separate circuit calls.
+- **OPEN:** protected work is rejected without contacting the dependency. The default wait before a recovery probe is ten seconds.
+- **HALF_OPEN:** one probe is permitted by default. Success closes the circuit; an availability failure opens it again.
+
+The diagnostics deadline defaults to **8s per REST GET**, including retries and delay—not per complete paginated scan. The AI deadline defaults to **20s per scoped diagnostic operation**. MCP initialize plus tool discovery is also bounded by 20s by default and participates in the circuit, so repeated initialization failures can open it. Initialization has **no application retry** because it creates protocol session state. Session cleanup is immediate/local best effort; it must not turn an outage into another long network wait.
+
+These are **per-boundary deadlines, not one global HTTP analysis deadline**. Existing HTTP connection/read timeouts, MCP transport timeouts, investigation budgets, and model request timeout still apply. A TimeLimiter timeout cancels its future but cannot guarantee that an upstream handler has stopped. Remaining local in-flight work is bounded by the executor limit and transport timeouts; a timeout is not proof that all remote work was cancelled.
+
+### External configuration
+
+Set optional overrides in the **same PowerShell terminal that starts the relevant application**, before startup; for example, `$env:ANALYSIS_RESILIENCE_OPERATION_TIMEOUT = '20s'`. Spring Boot does not load `.env` automatically. Root `.env.example` documents both boundaries; `ai-analysis-service/.env.example` documents only the AI boundary. Leave key/model placeholders blank and supply real credentials only through the launching environment.
+
+The table maps `diagnostics.resilience` and `analysis.resilience` properties to their exact environment names:
+
+| Property suffix (under either prefix) | Diagnostics environment variable | Analysis environment variable | Default diagnostics / analysis |
+| --- | --- | --- | --- |
+| `operation-timeout` | `DIAGNOSTICS_RESILIENCE_OPERATION_TIMEOUT` | `ANALYSIS_RESILIENCE_OPERATION_TIMEOUT` | `8s` / `20s` |
+| `max-attempts` | `DIAGNOSTICS_RESILIENCE_MAX_ATTEMPTS` | `ANALYSIS_RESILIENCE_MAX_ATTEMPTS` | `2` / `2` |
+| `retry-delay` | `DIAGNOSTICS_RESILIENCE_RETRY_DELAY` | `ANALYSIS_RESILIENCE_RETRY_DELAY` | `100ms` / `100ms` |
+| `sliding-window-size` | `DIAGNOSTICS_RESILIENCE_SLIDING_WINDOW_SIZE` | `ANALYSIS_RESILIENCE_SLIDING_WINDOW_SIZE` | `10` / `10` |
+| `minimum-number-of-calls` | `DIAGNOSTICS_RESILIENCE_MINIMUM_NUMBER_OF_CALLS` | `ANALYSIS_RESILIENCE_MINIMUM_NUMBER_OF_CALLS` | `5` / `5` |
+| `failure-rate-threshold` | `DIAGNOSTICS_RESILIENCE_FAILURE_RATE_THRESHOLD` | `ANALYSIS_RESILIENCE_FAILURE_RATE_THRESHOLD` | `50` / `50` (percent) |
+| `wait-duration-in-open-state` | `DIAGNOSTICS_RESILIENCE_WAIT_DURATION_IN_OPEN_STATE` | `ANALYSIS_RESILIENCE_WAIT_DURATION_IN_OPEN_STATE` | `10s` / `10s` |
+| `permitted-calls-in-half-open-state` | `DIAGNOSTICS_RESILIENCE_PERMITTED_CALLS_IN_HALF_OPEN_STATE` | `ANALYSIS_RESILIENCE_PERMITTED_CALLS_IN_HALF_OPEN_STATE` | `1` / `1` |
+| `max-concurrent-calls` | `DIAGNOSTICS_RESILIENCE_MAX_CONCURRENT_CALLS` | `ANALYSIS_RESILIENCE_MAX_CONCURRENT_CALLS` | `4` / `4` |
+
+Invalid settings fail startup validation. Attempts must be 1..3 (1 disables retries), concurrency 1..32, and minimum calls must not exceed the sliding window. Timeouts and open-state waits are positive and bounded; retry delay, window size, failure percentage, and half-open probes also have startup bounds. Increasing these settings is not a substitute for investigating a failing dependency.
+
+### Controlled failures and safe verification
+
+An exhausted retry, operation timeout, full executor, or open circuit does not produce stale, empty, or fabricated success evidence. Diagnostics retains its sanitized `DOWNSTREAM_UNAVAILABLE` tool error; the analysis API retains HTTP **503** with `DIAGNOSTICS_UNAVAILABLE`. Missing incidents still return **404**, not an outage fallback. Errors do not expose raw upstream messages, credentials, prompts, destination URLs, or cause stack traces.
+
+Prefer automated tests with private local HTTP/MCP fixtures and mocked model behavior. They can simulate transient failures, timeout, saturation, and circuit recovery without stopping real backends or contacting a model provider. From the repository root in Windows PowerShell, quote the comma-separated module selector:
+
+```powershell
+.\mvnw.cmd '-pl' 'diagnostics-mcp-server,ai-analysis-service' test
+```
+
+This focused run needs no Docker, running development applications, or real API key. The full reactor includes earlier infrastructure integration tests and requires Docker Desktop:
+
+```powershell
+.\mvnw.cmd test
+```
+
+These are verification commands, not a claim of test execution or results. No real backend/model outage or paid request is needed for Stage 12 verification.
+
+Optional manual outage observation is for a user-chosen development session only: stop **only the known incident-service or diagnostics MCP application with Ctrl+C in its own terminal**. Do not kill unrelated processes, stop infrastructure, or clear data. A stopped incident-service can be observed through the existing read-only MCP calls without an LLM; an analysis POST may incur model charges if diagnostics recovers, so it is not a harmless probe. Restart the stopped application with its earlier environment. After the circuit wait, a successful permitted probe restores calls; session reconnection may also be needed. Health UP alone still does not prove downstream recovery.
+
 ## Current boundaries
 
-Stage 10 adds read-only, evidence-referenced OpenAI incident analysis through the existing diagnostics MCP server. Stage 11 adds only a config-driven HTTP gateway; existing services remain independently accessible and no authentication, rate limiting, discovery, or circuit breaker is added. Earlier incident APIs, deterministic detection, health/history, simulator, and eventId idempotency remain unchanged. Model output never creates/resolves incidents, changes service state, or executes recommendations. Temporal event matches do not prove root cause or implement cross-service incident correlation. There is no production authentication, incident-list pagination, advanced state machine, Kubernetes, or application-container deployment implementation. Existing incidents are not automatically escalated or updated. Java 21, Spring Boot 4.0.9, and JUnit 5.13.4 remain unchanged; Spring AI 2.0.1 remains scoped to the earlier AI/MCP modules and Spring Cloud 2025.1.4 is imported only by api-gateway. No commits or pushes are made automatically.
+Stage 10 adds read-only, evidence-referenced OpenAI incident analysis through the existing diagnostics MCP server. Stage 11 adds only a config-driven HTTP gateway; existing services remain independently accessible and its no-Retry policy is unchanged. Stage 12 adds bounded retries, time limits, and per-process circuit breakers only for diagnostics REST GETs and scoped AI MCP diagnostic reads. No global analysis/model/gateway retry, authentication, rate limiting, or discovery is added. Earlier incident APIs, deterministic detection, health/history, simulator, eventId idempotency, and Kafka/Redis/database policies remain unchanged. Model output never creates/resolves incidents, changes service state, or executes recommendations. Temporal event matches do not prove root cause or implement cross-service incident correlation. There is no production authentication, incident-list pagination, advanced state machine, Kubernetes, or application-container deployment implementation. Existing incidents are not automatically escalated or updated. Java 21, Spring Boot 4.0.9, and JUnit 5.13.4 remain unchanged; Spring AI 2.0.1 remains scoped to the earlier AI/MCP modules. Spring Cloud 2025.1.4 is imported locally by api-gateway and, for Stage 12 resilience, diagnostics-mcp-server and ai-analysis-service—not by the root parent. No commits or pushes are made automatically.

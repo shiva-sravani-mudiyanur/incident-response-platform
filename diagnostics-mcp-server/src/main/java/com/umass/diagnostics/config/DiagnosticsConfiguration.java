@@ -17,7 +17,13 @@ public class DiagnosticsConfiguration {
 
     @Bean
     RestClient incidentServiceRestClient(RestClient.Builder builder, DiagnosticsProperties properties) {
-        var factory = new SimpleClientHttpRequestFactory();
+        var factory = new SimpleClientHttpRequestFactory() {
+            @Override
+            protected void prepareConnection(java.net.HttpURLConnection connection, String method) throws java.io.IOException {
+                super.prepareConnection(connection, method);
+                connection.setInstanceFollowRedirects(false);
+            }
+        };
         factory.setConnectTimeout(properties.connectTimeout());
         factory.setReadTimeout(properties.readTimeout());
         return builder.baseUrl(properties.incidentServiceBaseUrl().toString()).requestFactory(factory).build();

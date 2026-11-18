@@ -1,4 +1,9 @@
 spring:
+  cloud:
+    circuitbreaker:
+      bulkhead:
+        resilience4j:
+          enabled: false
   application:
     name: diagnostics-mcp-server
   ai:
@@ -47,6 +52,16 @@ management:
       show-details: never
       show-components: never
 diagnostics:
+  resilience:
+    operation-timeout: ${DIAGNOSTICS_RESILIENCE_OPERATION_TIMEOUT:8s}
+    max-attempts: ${DIAGNOSTICS_RESILIENCE_MAX_ATTEMPTS:2}
+    retry-delay: ${DIAGNOSTICS_RESILIENCE_RETRY_DELAY:100ms}
+    sliding-window-size: ${DIAGNOSTICS_RESILIENCE_SLIDING_WINDOW_SIZE:10}
+    minimum-number-of-calls: ${DIAGNOSTICS_RESILIENCE_MINIMUM_NUMBER_OF_CALLS:5}
+    failure-rate-threshold: ${DIAGNOSTICS_RESILIENCE_FAILURE_RATE_THRESHOLD:50}
+    wait-duration-in-open-state: ${DIAGNOSTICS_RESILIENCE_WAIT_DURATION_IN_OPEN_STATE:10s}
+    permitted-calls-in-half-open-state: ${DIAGNOSTICS_RESILIENCE_PERMITTED_CALLS_IN_HALF_OPEN_STATE:1}
+    max-concurrent-calls: ${DIAGNOSTICS_RESILIENCE_MAX_CONCURRENT_CALLS:4}
   incident-service-base-url: ${INCIDENT_SERVICE_BASE_URL}
   connect-timeout: ${DIAGNOSTICS_CONNECT_TIMEOUT:2s}
   read-timeout: ${DIAGNOSTICS_READ_TIMEOUT:5s}

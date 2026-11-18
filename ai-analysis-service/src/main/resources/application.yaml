@@ -1,6 +1,11 @@
 spring:
   application:
     name: ai-analysis-service
+  cloud:
+    circuitbreaker:
+      bulkhead:
+        resilience4j:
+          enabled: false
   autoconfigure:
     exclude:
       - org.springframework.ai.model.openai.autoconfigure.OpenAiEmbeddingAutoConfiguration
@@ -51,6 +56,16 @@ management:
       show-details: never
       show-components: never
 analysis:
+  resilience:
+    operation-timeout: ${ANALYSIS_RESILIENCE_OPERATION_TIMEOUT:20s}
+    max-attempts: ${ANALYSIS_RESILIENCE_MAX_ATTEMPTS:2}
+    retry-delay: ${ANALYSIS_RESILIENCE_RETRY_DELAY:100ms}
+    sliding-window-size: ${ANALYSIS_RESILIENCE_SLIDING_WINDOW_SIZE:10}
+    minimum-number-of-calls: ${ANALYSIS_RESILIENCE_MINIMUM_NUMBER_OF_CALLS:5}
+    failure-rate-threshold: ${ANALYSIS_RESILIENCE_FAILURE_RATE_THRESHOLD:50}
+    wait-duration-in-open-state: ${ANALYSIS_RESILIENCE_WAIT_DURATION_IN_OPEN_STATE:10s}
+    permitted-calls-in-half-open-state: ${ANALYSIS_RESILIENCE_PERMITTED_CALLS_IN_HALF_OPEN_STATE:1}
+    max-concurrent-calls: ${ANALYSIS_RESILIENCE_MAX_CONCURRENT_CALLS:4}
   diagnostics-mcp-base-url: ${DIAGNOSTICS_MCP_BASE_URL}
   mcp-connect-timeout: ${ANALYSIS_MCP_CONNECT_TIMEOUT:3s}
   mcp-request-timeout: ${ANALYSIS_MCP_REQUEST_TIMEOUT:15s}

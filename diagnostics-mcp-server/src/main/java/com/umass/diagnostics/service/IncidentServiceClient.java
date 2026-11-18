@@ -15,10 +15,18 @@ import java.util.Set;
 @Component
 public class IncidentServiceClient {
     private final RestClient client;
-    public IncidentServiceClient(RestClient client) { this.client = client; }
+    private final IncidentReadPolicy policy;
+    public IncidentServiceClient(RestClient client, IncidentReadPolicy policy) {
+        this.client = client;
+        this.policy = policy;
+    }
 
     public IncidentDetails getIncident(String id) {
-        var incident = get(client.get().uri("/api/incidents/{id}", id), IncidentDetails.class);
+        return policy.execute(() -> readIncident(id));
+    }
+
+    private IncidentDetails readIncident(String id) {
+        var incident = get(() -> client.get().uri("/api/incidents/{id}", id), IncidentDetails.class);
         require(incident != null && id.equalsIgnoreCase(incident.id()) && canonicalUuid(incident.id())
                 && incident.title() != null && !incident.title().isBlank()
                 && incident.status() != null && Set.of("OPEN", "INVESTIGATING", "RESOLVED").contains(incident.status())
@@ -30,7 +38,11 @@ public class IncidentServiceClient {
     }
 
     public ServiceHealth getServiceHealth(String name) {
-        var health = get(client.get().uri("/api/services/{name}/health", name), ServiceHealth.class);
+        return policy.execute(() -> readServiceHealth(name));
+    }
+
+    private ServiceHealth readServiceHealth(String name) {
+        var health = get(() -> client.get().uri("/api/services/{name}/health", name), ServiceHealth.class);
         require(health != null && name.equals(health.serviceName()) && health.status() != null
                 && Set.of("HEALTHY", "DEGRADED", "DOWN").contains(health.status())
                 && health.errorsLastMinute() != null && health.errorsLastMinute() >= 0
@@ -39,7 +51,11 @@ public class IncidentServiceClient {
     }
 
     public ServiceEventsPage getServiceEvents(String name, int page, int size) {
-        var history = get(client.get().uri("/api/services/{name}/events?page={page}&size={size}", name, page, size), ServiceEventsPage.class);
+        return policy.execute(() -> readServiceEvents(name, page, size));
+    }
+
+    private ServiceEventsPage readServiceEvents(String name, int page, int size) {
+        var history = get(() -> client.get().uri("/api/services/{name}/events?page={page}&size={size}", name, page, size), ServiceEventsPage.class);
         require(history != null && name.equals(history.serviceName()) && history.events() != null
                 && history.page() != null && history.page() == page && history.size() != null && history.size() == size
                 && history.totalElements() != null && history.totalElements() >= 0
@@ -58,22 +74,44 @@ public class IncidentServiceClient {
         return history;
     }
 
-    private <T> T get(RestClient.RequestHeadersSpec<?> request, Class<T> type) {
+    private <T> T get(java.util.function.Supplier<RestClient.RequestHeadersSpec<?>> request, Class<T> type) {
+        return attempt(request.get(), type);
+    }
+
+    private <T> T attempt(RestClient.RequestHeadersSpec<?> request, Class<T> type) {
         try {
             return request.retrieve().onStatus(status -> !status.is2xxSuccessful(), (req, response) -> {
                 int status = response.getStatusCode().value();
                 if (status == 404) throw new DiagnosticException("NOT_FOUND", "Requested resource was not found.");
-                if (status == 429 || status >= 500) throw unavailable();
+                if (Set.of(408, 429, 500, 502, 503, 504).contains(status)) throw new IncidentReadPolicy.TransientReadFailure();
+                if (status >= 500) throw unavailable();
                 throw invalidResponse();
             }).body(type);
         } catch (ResourceAccessException exception) {
-            throw unavailable();
+            checkCancellation(exception);
+            throw new IncidentReadPolicy.TransientReadFailure();
         } catch (RestClientException | HttpMessageConversionException exception) {
+            checkCancellation(exception);
             for (Throwable cause = exception; cause != null; cause = cause.getCause()) {
-                if (cause instanceof java.io.InterruptedIOException || cause instanceof java.net.SocketException
-                        || cause instanceof java.net.http.HttpTimeoutException) throw unavailable();
+                // Do not treat parser/mapping IOException subclasses as transient transport failures.
+                if (cause.getClass() == java.io.IOException.class || cause instanceof java.io.EOFException
+                        || cause instanceof java.io.InterruptedIOException || cause instanceof java.net.SocketException
+                        || cause instanceof java.net.http.HttpTimeoutException) throw new IncidentReadPolicy.TransientReadFailure();
             }
             throw invalidResponse();
+        }
+    }
+
+    private static void checkCancellation(Throwable error) {
+        boolean interrupted = Thread.currentThread().isInterrupted();
+        for (Throwable cause = error; cause != null; cause = cause.getCause()) {
+            interrupted |= cause instanceof InterruptedException
+                    || cause instanceof java.util.concurrent.CancellationException
+                    || cause instanceof java.io.InterruptedIOException && !(cause instanceof java.net.SocketTimeoutException);
+        }
+        if (interrupted) {
+            Thread.currentThread().interrupt();
+            throw new java.util.concurrent.CancellationException("Incident read cancelled.");
         }
     }
 

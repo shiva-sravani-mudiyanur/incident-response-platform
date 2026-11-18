@@ -2,6 +2,7 @@ package com.umass.analysis.mcp;
 
 import com.umass.analysis.config.AnalysisProperties;
 import com.umass.analysis.exception.AnalysisException;
+import com.umass.analysis.resilience.McpReadResilience;
 import io.modelcontextprotocol.client.McpClient;
 import io.modelcontextprotocol.client.McpSyncClient;
 import io.modelcontextprotocol.client.transport.HttpClientStreamableHttpTransport;
@@ -21,10 +22,12 @@ public class StreamableDiagnosticsGateway implements DiagnosticsGateway {
             "get_service_health", "serviceName", "get_recent_errors", "serviceName", "get_error_frequency", "serviceName");
     private final AnalysisProperties properties;
     private final ObjectMapper mapper;
+    private final McpReadResilience resilience;
 
-    public StreamableDiagnosticsGateway(AnalysisProperties properties, ObjectMapper mapper) {
+    public StreamableDiagnosticsGateway(AnalysisProperties properties, ObjectMapper mapper, McpReadResilience resilience) {
         this.properties = properties;
         this.mapper = mapper;
+        this.resilience = resilience;
     }
 
     @Override
@@ -38,14 +41,17 @@ public class StreamableDiagnosticsGateway implements DiagnosticsGateway {
                     .endpoint("/mcp").connectTimeout(properties.mcpConnectTimeout()).openConnectionOnStartup(false).build();
             client = McpClient.sync(transport).requestTimeout(properties.mcpRequestTimeout())
                     .initializationTimeout(properties.mcpRequestTimeout()).build();
-            client.initialize();
-            var tools = client.listTools().tools();
-            for (String name : PARAMETERS.keySet()) {
-                var tool = tools.stream().filter(candidate -> name.equals(candidate.name())).findFirst().orElseThrow();
-                if (tool.annotations() == null || !Boolean.TRUE.equals(tool.annotations().readOnlyHint())
-                        || !Boolean.FALSE.equals(tool.annotations().destructiveHint())) throw unavailable();
-            }
-            return new PinnedSession(client, incidentId);
+            McpSyncClient openedClient = client;
+            return resilience.once(() -> {
+                openedClient.initialize();
+                var tools = openedClient.listTools().tools();
+                for (String name : PARAMETERS.keySet()) {
+                    var tool = tools.stream().filter(candidate -> name.equals(candidate.name())).findFirst().orElseThrow();
+                    if (tool.annotations() == null || !Boolean.TRUE.equals(tool.annotations().readOnlyHint())
+                            || !Boolean.FALSE.equals(tool.annotations().destructiveHint())) throw unavailable();
+                }
+                return new PinnedSession(openedClient, incidentId);
+            });
         } catch (RuntimeException exception) {
             closeQuietly(client);
             throw unavailable();
@@ -75,7 +81,8 @@ public class StreamableDiagnosticsGateway implements DiagnosticsGateway {
             if (rootService == null && !toolName.equals("get_incident")) throw policyViolation();
             if (++calls > properties.maxToolCalls()) throw policyViolation();
             try {
-                var response = client.callTool(new McpSchema.CallToolRequest(toolName, arguments));
+                var request = new McpSchema.CallToolRequest(toolName, Map.copyOf(arguments));
+                var response = resilience.read(() -> client.callTool(request));
                 Map<String, Object> envelope = object(response.structuredContent());
                 if (!Boolean.FALSE.equals(response.isError()) || !Boolean.TRUE.equals(envelope.get("success"))) {
                     Object error = envelope.get("error");
