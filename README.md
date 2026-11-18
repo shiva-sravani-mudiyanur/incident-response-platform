@@ -11,8 +11,9 @@ A portfolio-focused distributed incident response platform. The intended system 
 | service-simulator | 8083 | Generate development scenarios through event-service's HTTP API only | event-service over HTTP |
 | diagnostics-mcp-server | 8084 | Read-only MCP diagnostic tools over Streamable HTTP | incident-service over HTTP only |
 | ai-analysis-service | 8085 | Evidence-grounded, read-only incident analysis with a bounded tool loop | diagnostics MCP over Streamable HTTP; OpenAI chat model |
+| api-gateway | 8081 | Config-driven HTTP entry point for event, incident, service, analysis, and simulation APIs | Selected downstream services over HTTP only |
 
-All five modules use Java 21 and Spring Boot 4.0.9, inherited from the root Maven POM. Each runs as its own application in a separate terminal. SERVER_PORT can override its default port. Stage 4 connects event-service and incident-service through Kafka and persists incident_events asynchronously. Stage 5 adds Redis-backed failure correlation and deterministic automatic incident creation without an LLM. Stage 7 adds an HTTP-only scenario generator; it does not implement detection or access Kafka, Redis, PostgreSQL, or the incident API directly. Stage 8 adds operational health/history APIs; Stage 9 exposes five read-only MCP tools backed only by those REST APIs and the existing incident API. Stage 10 adds a separate OpenAI-backed analysis service that reads diagnostics through MCP only; detection remains deterministic.
+All six modules use Java 21 and Spring Boot 4.0.9, inherited from the root Maven POM. Each runs as its own application in a separate terminal. SERVER_PORT can override its default port. Stage 4 connects event-service and incident-service through Kafka and persists incident_events asynchronously. Stage 5 adds Redis-backed failure correlation and deterministic automatic incident creation without an LLM. Stage 7 adds an HTTP-only scenario generator; it does not implement detection or access Kafka, Redis, PostgreSQL, or the incident API directly. Stage 8 adds operational health/history APIs; Stage 9 exposes five read-only MCP tools backed only by those REST APIs and the existing incident API. Stage 10 adds a separate OpenAI-backed analysis service that reads diagnostics through MCP only; detection remains deterministic. Stage 11 adds an optional API gateway on loopback port 8081 as one convenient client entry point; existing services and their internal communication remain independent.
 
 ## Stages 1–2: Incident Service and PostgreSQL Persistence
 
@@ -79,6 +80,13 @@ ai-analysis-service/
     config/                     Validated analysis budgets and environment configuration
     exception/                  Sanitized analysis failures
   src/test/java/                Mock-ChatModel unit/HTTP tests, private MCP fixture, opt-in live IT
+api-gateway/
+  pom.xml                       Gateway-only Spring Cloud BOM and WebFlux gateway starter
+  .env.example                  Nonsecret destination URLs and gateway-local settings
+  src/main/java/                Gateway application; no domain or infrastructure clients
+  src/main/resources/
+    application.yaml            Config-driven routes, HTTP timeouts, loopback, health only
+  src/test/java/                Private loopback downstream stubs; no Docker or live providers
 ```
 
 Request flow:
@@ -90,7 +98,7 @@ HTTP -> IncidentController -> IncidentService -> IncidentRepository -> PostgreSQ
 
 JPA entities are never returned from controllers. Creation assigns a UUID, OPEN status, and UTC creation/update timestamps on the server. The caller supplies title, severity, rootService, and errorCount. Timestamp precision is normalized to PostgreSQL microseconds so a creation response matches subsequent retrieval. Status updates preserve identity, creation time, and other incident fields. All three defined statuses are accepted; no transition restrictions are introduced in this stage.
 
-Stage 2 added PostgreSQL persistence; Stage 4 added KRaft Kafka and a topic initializer to Compose; Stage 5 adds transient Redis correlation state. All five Java applications run natively on Windows, not in containers; Compose still runs infrastructure only. Stage 8 exposes operational REST APIs and restricted Actuator health/info/metrics in incident-service. Stage 9 adds a REST-backed MCP server; Stage 10 adds read-only AI analysis. Gateway and Kubernetes remain unimplemented.
+Stage 2 added PostgreSQL persistence; Stage 4 added KRaft Kafka and a topic initializer to Compose; Stage 5 adds transient Redis correlation state. All six Java applications run natively on Windows, not in containers; Compose still runs infrastructure only. Stage 8 exposes operational REST APIs and restricted Actuator health/info/metrics in incident-service. Stage 9 adds a REST-backed MCP server; Stage 10 adds read-only AI analysis. Stage 11 adds an HTTP-only API gateway; Kubernetes remains unimplemented.
 
 ## Prerequisites
 
@@ -203,7 +211,7 @@ $env:SERVER_PORT = '8080'
 .\mvnw.cmd -pl incident-service spring-boot:run
 ```
 
-If another application uses port 8080, set SERVER_PORT to an available port such as 8081, and use that port in API requests. Keep the application terminal open and use a second terminal for HTTP requests.
+If another application uses port 8080, set SERVER_PORT to an available port and use that port in API requests. Port 8081 is reserved for the Stage 11 gateway by default; if changing incident-service's port, also update GATEWAY_INCIDENT_SERVICE_URL in the gateway terminal. Keep the application terminal open and use a second terminal for HTTP requests.
 
 Flyway applies `V1__create_incidents_table.sql` and the new `V2__create_incident_events_table.sql` when incident-service starts. Existing Stage 2/3 databases apply only the new V2; V1 is unchanged. Compose alone does not create application tables. Hibernate uses `ddl-auto=validate` and never creates or updates tables. A configuration/migration/connection failure prevents startup rather than silently using another database. Create the Kafka topic before starting the listener.
 
@@ -420,7 +428,7 @@ Run just the event service/controller unit tests:
 .\mvnw.cmd -pl event-service '-Dtest=EventServiceTest,EventControllerTest,KafkaEventPublisherTest' test
 ```
 
-The root command `.\mvnw.cmd clean verify` builds and tests all three modules, including the Stage 7 simulator. Docker is required for the earlier infrastructure integration suites, not for simulator tests. Compose runs infrastructure only; application containerization is not part of Stage 7.
+The root command `.\mvnw.cmd clean verify` builds and tests all six modules, including the Stage 7 simulator and Stage 11 gateway. Docker is required for the earlier infrastructure integration suites, not for simulator or gateway tests. Compose runs infrastructure only; application containerization is not part of Stage 7.
 
 ## Stage 4: Kafka delivery and database verification
 
@@ -943,6 +951,92 @@ $env:MANUAL_ANALYSIS_INCIDENT_ID = Read-Host 'Existing incident UUID for the liv
 
 The integration test fails clearly for missing opt-in/required settings rather than silently pretending it called OpenAI. Its live IT naming is excluded from ordinary Surefire execution, with an additional explicit-profile guard. No live OpenAI integration run is claimed by automated verification.
 
+## Stage 11: Config-driven API Gateway
+
+api-gateway is the sixth independent application. It uses Spring Cloud Gateway Server WebFlux with embedded Netty, not a Spring MVC proxy. The **gateway-only** Spring Cloud BOM **2025.1.4** supplies Gateway **5.0.4** through `spring-cloud-starter-gateway-server-webflux`. Java 21, Spring Boot 4.0.9, and JUnit 5.13.4 remain pinned; no shared framework upgrade is introduced.
+
+```text
+Client / Postman -> api-gateway (127.0.0.1:8081)
+  /api/events/**                         -> event-service (8082) -> Kafka
+  /api/incidents/** and /api/services/** -> incident-service (8080) -> PostgreSQL / Redis
+  /api/analysis/**                       -> ai-analysis-service (8085)
+                                            -> diagnostics MCP (8084) -> incident-service (8080)
+                                            -> configured model provider
+  /simulate/**                           -> service-simulator (8083) -> event-service
+```
+
+The gateway forwards HTTP requests only. It never directly accesses PostgreSQL, Redis, Kafka, MCP, or an LLM. Existing internal ports and service-to-service URLs are unchanged; the simulator still calls event-service directly, diagnostics still calls incident-service directly, and analysis still uses MCP directly. Clients can continue using the existing service ports. This is a convenient entry point, **not network isolation or authentication**.
+
+### Start in a new Windows PowerShell terminal
+
+Use a separate terminal at the repository root. All four destination variables are required, even if you only plan to exercise one route. Set each explicitly; variables from the other service terminals do not carry over:
+
+```powershell
+Set-Location 'C:\Users\Shiva Sravani\Desktop\incident-response'
+$env:SERVER_ADDRESS = '127.0.0.1'
+$env:SERVER_PORT = '8081'
+$env:GATEWAY_EVENT_SERVICE_URL = 'http://127.0.0.1:8082'
+$env:GATEWAY_INCIDENT_SERVICE_URL = 'http://127.0.0.1:8080'
+$env:GATEWAY_ANALYSIS_SERVICE_URL = 'http://127.0.0.1:8085'
+$env:GATEWAY_SIMULATOR_URL = 'http://127.0.0.1:8083'
+$env:GATEWAY_CONNECT_TIMEOUT_MS = '2000'
+$env:GATEWAY_RESPONSE_TIMEOUT = '5m'
+.\mvnw.cmd -pl api-gateway spring-boot:run
+```
+
+Keep this terminal open; Ctrl+C stops only the gateway. Spring Boot does not load root or module `.env` files automatically. No database credentials, broker/cache settings, MCP URL, model name, or API key are needed in this terminal. Start the downstream applications separately using their earlier sections when you need their routes. The gateway does not launch them or replace their infrastructure prerequisites.
+
+SERVER_ADDRESS defaults to `127.0.0.1` and SERVER_PORT to `8081`. The four destination URLs above are local examples, not fallback defaults. If a downstream port changes, update its corresponding URL before restarting the gateway. GATEWAY_CONNECT_TIMEOUT_MS defaults to `2000` milliseconds; GATEWAY_RESPONSE_TIMEOUT defaults to `5m` to accommodate bounded analysis calls. Configure a caller's own timeout accordingly. Increasing a gateway timeout does not change downstream budgets or guarantee provider success.
+
+### Routing table
+
+Routes are configured in `api-gateway/src/main/resources/application.yaml`. Paths and query parameters are forwarded without stripping prefixes or rewriting paths; the existing downstream request/response contracts still apply.
+
+| Incoming gateway path | Destination variable | Local example |
+| --- | --- | --- |
+| `/api/events/**` | GATEWAY_EVENT_SERVICE_URL | `http://127.0.0.1:8082` |
+| `/api/incidents/**` | GATEWAY_INCIDENT_SERVICE_URL | `http://127.0.0.1:8080` |
+| `/api/services/**` | GATEWAY_INCIDENT_SERVICE_URL | `http://127.0.0.1:8080` |
+| `/api/analysis/**` | GATEWAY_ANALYSIS_SERVICE_URL | `http://127.0.0.1:8085` |
+| `/simulate/**` | GATEWAY_SIMULATOR_URL | `http://127.0.0.1:8083` |
+
+There is no catch-all proxy, MCP proxy, or downstream Actuator proxy. Only the gateway's own read-only `/actuator/health` is exposed. Gateway administration, metrics, environment/configuration endpoints, and JMX exposure are not enabled. No automatic retry filters, authentication, rate limits, service discovery, or circuit breakers are added.
+
+### Safe GET smoke checks in Postman
+
+These are instructions for manual verification, **not a claim that the agent ran a smoke test against live applications**. Use GET and no request body:
+
+1. With the gateway running, request `http://127.0.0.1:8081/actuator/health`. Expect HTTP 200 and status UP for a healthy gateway process. This does **not** prove any destination is running, that its database/broker/cache is available, or that MCP/OpenAI calls will succeed.
+2. With incident-service and its existing infrastructure running, request `http://127.0.0.1:8081/api/incidents`. Expect HTTP 200 and the existing incident array, which may be empty. Optional: GET `http://127.0.0.1:8081/api/incidents?status=OPEN` to check query forwarding without changing data.
+3. GET `http://127.0.0.1:8081/api/services`. Expect HTTP 200 and the existing service inventory array, which may be empty. This is event-derived operational health, not a gateway reachability probe.
+4. If the inventory already contains a service, copy its exact name and GET its `/api/services/{serviceName}/health` and `/api/services/{serviceName}/events?page=0&size=20` through port 8081. Unknown services return the downstream 404; do not generate events just to make this read-only smoke check pass.
+5. GET `http://127.0.0.1:8081/actuator/env`, `/actuator/metrics`, `/actuator/gateway/routes`, and `/mcp` (each on the same gateway origin). These unexposed/unrouted paths should return 404, not downstream administration or MCP data.
+
+**Do not use POST as a harmless connectivity check.** POST `/api/events` and POST `/simulate/**` can publish real development events and trigger incident creation. POST `/api/analysis/incidents/{incidentId}` can send operational data to the real model provider and incur charges. Forwarding those requests does not make them safer; only use the earlier stage contracts when you intentionally want those effects. There is still no event-retrieval GET endpoint or analysis-list GET endpoint.
+
+### Downstream failures and health semantics
+
+A destination can be unavailable while gateway health remains UP. Requests to that destination then fail with an HTTP error; connection failures and response timeouts are not successful forwarding, and failure status can depend on the failure type. Successful HTTP transport also does not prove asynchronous Kafka consumption, incident persistence, or correct model reasoning. Inspect the routed response using the downstream stage's documented semantics.
+
+The gateway does not synthesize a successful fallback, and no Retry filter is configured. A timeout or disconnected caller does not prove that a downstream POST had no effect, nor does it cancel work already accepted downstream. Do not blindly resend an event, rerun a simulation, or repeat a potentially chargeable analysis. Preserve event IDs and check existing evidence where appropriate; existing eventId idempotency does not deduplicate a new simulator invocation.
+
+### Gateway-only tests and verification
+
+From the repository root in Windows PowerShell:
+
+```powershell
+.\mvnw.cmd -pl api-gateway test
+.\mvnw.cmd -pl api-gateway clean verify
+```
+
+Gateway tests use private loopback downstream HTTP stubs, not your running applications. They need no Docker, API key, real MCP server, or live model/provider calls. Full reactor tests still require Docker Desktop for earlier modules' infrastructure tests:
+
+```powershell
+.\mvnw.cmd test
+```
+
+No Compose application service or infrastructure change is introduced. This unauthenticated gateway is for trusted local development; binding it to loopback does not secure existing downstream listeners. Production authentication, network controls, and deployment remain outside Stage 11.
+
 ## Current boundaries
 
-Stage 10 adds read-only, evidence-referenced OpenAI incident analysis through the existing diagnostics MCP server. Earlier incident APIs, deterministic detection, health/history, simulator, and eventId idempotency remain unchanged. Model output never creates/resolves incidents, changes service state, or executes recommendations. Temporal event matches do not prove root cause or implement cross-service incident correlation. There is no production authentication, incident-list pagination, advanced state machine, Gateway, Kubernetes, or application-container deployment implementation. Existing incidents are not automatically escalated or updated. Existing framework versions remain unchanged; Spring AI 2.0.1 is reused for the new module. No commits or pushes are made automatically.
+Stage 10 adds read-only, evidence-referenced OpenAI incident analysis through the existing diagnostics MCP server. Stage 11 adds only a config-driven HTTP gateway; existing services remain independently accessible and no authentication, rate limiting, discovery, or circuit breaker is added. Earlier incident APIs, deterministic detection, health/history, simulator, and eventId idempotency remain unchanged. Model output never creates/resolves incidents, changes service state, or executes recommendations. Temporal event matches do not prove root cause or implement cross-service incident correlation. There is no production authentication, incident-list pagination, advanced state machine, Kubernetes, or application-container deployment implementation. Existing incidents are not automatically escalated or updated. Java 21, Spring Boot 4.0.9, and JUnit 5.13.4 remain unchanged; Spring AI 2.0.1 remains scoped to the earlier AI/MCP modules and Spring Cloud 2025.1.4 is imported only by api-gateway. No commits or pushes are made automatically.

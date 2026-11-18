@@ -1,0 +1,59 @@
+spring:
+  application:
+    name: api-gateway
+  main:
+    web-application-type: reactive
+  cloud:
+    discovery:
+      enabled: false
+    gateway:
+      server:
+        webflux:
+          httpclient:
+            connect-timeout: ${GATEWAY_CONNECT_TIMEOUT_MS:2000}
+            response-timeout: ${GATEWAY_RESPONSE_TIMEOUT:5m}
+          routes:
+            - id: events
+              uri: ${GATEWAY_EVENT_SERVICE_URL}
+              predicates:
+                - Path=/api/events/**
+            - id: incidents
+              uri: ${GATEWAY_INCIDENT_SERVICE_URL}
+              predicates:
+                - Path=/api/incidents/**
+            - id: services
+              uri: ${GATEWAY_INCIDENT_SERVICE_URL}
+              predicates:
+                - Path=/api/services/**
+            - id: analysis
+              uri: ${GATEWAY_ANALYSIS_SERVICE_URL}
+              predicates:
+                - Path=/api/analysis/**
+            - id: simulator
+              uri: ${GATEWAY_SIMULATOR_URL}
+              predicates:
+                - Path=/simulate/**
+server:
+  address: ${SERVER_ADDRESS:127.0.0.1}
+  port: ${SERVER_PORT:8081}
+  error:
+    include-message: never
+    include-stacktrace: never
+    include-exception: false
+management:
+  endpoints:
+    access:
+      default: none
+    web:
+      discovery:
+        enabled: false
+      exposure:
+        include: health
+    jmx:
+      exposure:
+        exclude: '*'
+  endpoint:
+    health:
+      access: read-only
+      show-details: never
+      show-components: never

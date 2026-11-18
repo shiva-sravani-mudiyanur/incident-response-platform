@@ -24,5 +24,6 @@
         <module>service-simulator</module>
         <module>diagnostics-mcp-server</module>
         <module>ai-analysis-service</module>
+        <module>api-gateway</module>
     </modules>
 </project>
