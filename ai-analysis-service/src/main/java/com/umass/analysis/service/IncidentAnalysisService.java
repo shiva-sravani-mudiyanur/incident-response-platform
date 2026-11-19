@@ -49,11 +49,27 @@ public class IncidentAnalysisService {
     private final ObjectMapper mapper;
     private final BeanOutputConverter<Draft> converter = new BeanOutputConverter<>(Draft.class);
 
-    public IncidentAnalysisService(ChatModel model, DiagnosticsGateway gateway, AnalysisProperties properties, ObjectMapper mapper) {
+    private final AnalysisMetrics metrics;
+
+    public IncidentAnalysisService(ChatModel model, DiagnosticsGateway gateway, AnalysisProperties properties, ObjectMapper mapper,
+                                   AnalysisMetrics metrics) {
         this.model = model; this.gateway = gateway; this.properties = properties; this.mapper = mapper;
+        this.metrics = metrics;
     }
 
     public AnalysisResponse analyze(String incidentId) {
+        long started = System.nanoTime();
+        boolean success = false;
+        try {
+            AnalysisResponse response = analyzeIncident(incidentId);
+            success = true;
+            return response;
+        } finally {
+            metrics.record(System.nanoTime() - started, success);
+        }
+    }
+
+    private AnalysisResponse analyzeIncident(String incidentId) {
         if (incidentId == null || !incidentId.matches("[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")) {
             throw new AnalysisException(HttpStatus.BAD_REQUEST, "INVALID_INCIDENT_ID", "A canonical incident UUID is required.");
         }

@@ -46,7 +46,7 @@ management:
       discovery:
         enabled: false
       exposure:
-        include: health
+        include: health,info,metrics,prometheus
     jmx:
       exposure:
         exclude: '*'
@@ -55,6 +55,19 @@ management:
       access: read-only
       show-details: never
       show-components: never
+    info:
+      access: read-only
+    metrics:
+      access: read-only
+    prometheus:
+      access: read-only
+  metrics:
+    tags:
+      application: ${spring.application.name}
+logging:
+  structured:
+    format:
+      console: logstash
 analysis:
   resilience:
     operation-timeout: ${ANALYSIS_RESILIENCE_OPERATION_TIMEOUT:20s}

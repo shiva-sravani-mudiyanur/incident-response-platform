@@ -22,7 +22,17 @@ public class EventConsumer {
     public void consume(ServiceEvent event, @Header(KafkaHeaders.RECEIVED_TOPIC) String topic,
                         @Header(KafkaHeaders.RECEIVED_PARTITION) int partition,
                         @Header(KafkaHeaders.OFFSET) long offset) {
-        processing.process(event);
-        log.info("Consumed event eventId={} topic={} partition={} offset={}", event.eventId(), topic, partition, offset);
+        try (var trace = new com.umass.incident.observability.EventTraceScope(event == null ? null : event.traceId())) {
+            processing.process(event);
+            log.atInfo().addKeyValue("eventId", event == null ? null : event.eventId())
+                    .addKeyValue("topic", topic).addKeyValue("partition", partition).addKeyValue("offset", offset)
+                    .log("Event consumed");
+        } catch (RuntimeException | Error failure) {
+            try (var trace = new com.umass.incident.observability.EventTraceScope(event == null ? null : event.traceId())) {
+                log.atWarn().addKeyValue("eventId", event == null ? null : event.eventId())
+                        .addKeyValue("partition", partition).addKeyValue("offset", offset).log("Event consumption failed; delivery will retry");
+            }
+            throw failure;
+        }
     }
 }

@@ -19,6 +19,29 @@ import static org.mockito.Mockito.verify;
 
 @ExtendWith(MockitoExtension.class)
 class EventConsumerTest {
+    @Test
+    void scopesTraceDuringProcessingAndRestoresItOnSuccessFailureAndNullTrace() {
+        var original = event();
+        for (String trace : new String[]{"trace-consumer", null}) {
+            var input = new ServiceEvent(original.eventId(), original.serviceName(), original.eventType(),
+                    original.severity(), original.message(), original.timestamp(), trace, original.metadata());
+            for (boolean fail : new boolean[]{false, true}) {
+                org.slf4j.MDC.put("traceId", "outer");
+                org.mockito.Mockito.doAnswer(call -> {
+                    org.assertj.core.api.Assertions.assertThat(org.slf4j.MDC.get("traceId")).isEqualTo(trace);
+                    if (fail) throw new IllegalStateException("not logged");
+                    return null;
+                }).when(processing).process(input);
+                try {
+                    if (fail) assertThatThrownBy(() -> new EventConsumer(processing).consume(input, "service-events", 0, 1))
+                            .isInstanceOf(IllegalStateException.class);
+                    else new EventConsumer(processing).consume(input, "service-events", 0, 1);
+                    org.assertj.core.api.Assertions.assertThat(org.slf4j.MDC.get("traceId")).isEqualTo("outer");
+                } finally { org.slf4j.MDC.clear(); }
+            }
+        }
+    }
+
     @Mock
     private EventProcessingService processing;
 

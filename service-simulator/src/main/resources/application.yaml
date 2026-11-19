@@ -7,10 +7,35 @@ server:
     include-message: never
     include-stacktrace: never
 management:
+  metrics:
+    tags:
+      application: ${spring.application.name}
   endpoints:
+    access:
+      default: none
     web:
+      discovery:
+        enabled: false
       exposure:
-        include: health
+        include: health,info,metrics,prometheus
+    jmx:
+      exposure:
+        exclude: '*'
+  endpoint:
+    info:
+      access: read-only
+    metrics:
+      access: read-only
+    prometheus:
+      access: read-only
+    health:
+      access: read-only
+      show-details: never
+      show-components: never
+logging:
+  structured:
+    format:
+      console: logstash
 simulator:
   event-service-base-url: ${EVENT_SERVICE_BASE_URL}
   failure-event-count: ${SIMULATOR_FAILURE_EVENT_COUNT:5}

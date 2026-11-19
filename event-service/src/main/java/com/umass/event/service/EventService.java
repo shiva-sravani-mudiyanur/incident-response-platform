@@ -12,8 +12,11 @@ public class EventService {
     private static final Logger log = LoggerFactory.getLogger(EventService.class);
     private final KafkaEventPublisher publisher;
 
-    public EventService(KafkaEventPublisher publisher) {
+    private final EventMetrics metrics;
+
+    public EventService(KafkaEventPublisher publisher, EventMetrics metrics) {
         this.publisher = publisher;
+        this.metrics = metrics;
     }
 
     public ServiceEvent accept(ServiceEvent event) {
@@ -21,11 +24,12 @@ public class EventService {
         Map<String, String> metadata = event.metadata() == null ? Map.of() : Map.copyOf(event.metadata());
         ServiceEvent accepted = new ServiceEvent(eventId, event.serviceName(), event.eventType(),
                 event.severity(), event.message(), event.timestamp(), event.traceId(), metadata);
-        publisher.publish(accepted);
-        // Log identifiers, not potentially sensitive message/metadata payloads.
-        String logServiceName = accepted.serviceName().replace('\r', '_').replace('\n', '_');
-        log.info("Accepted event eventId={} serviceName={} eventType={} severity={} timestamp={}",
-                accepted.eventId(), logServiceName, accepted.eventType(), accepted.severity(), accepted.timestamp());
-        return accepted;
+        metrics.received();
+        try (var ignored = new EventTraceScope(accepted.traceId())) {
+            log.atInfo().addKeyValue("eventId", accepted.eventId())
+                    .addKeyValue("serviceName", accepted.serviceName()).log("Received event");
+            publisher.publish(accepted);
+            return accepted;
+        }
     }
 }

@@ -43,6 +43,8 @@ class EventProcessingServiceTest {
     @Mock
     private CorrelationService correlation;
     private EventProcessingService service;
+    private io.micrometer.core.instrument.simple.SimpleMeterRegistry registry;
+    private com.umass.incident.observability.IncidentMetrics metrics;
 
     @BeforeAll
     static void startValidation() {
@@ -56,7 +58,24 @@ class EventProcessingServiceTest {
 
     @BeforeEach
     void setUp() {
-        service = new EventProcessingService(repository, validators.getValidator(), Clock.fixed(NOW, ZoneOffset.UTC), correlation);
+        registry = new io.micrometer.core.instrument.simple.SimpleMeterRegistry();
+        metrics = new com.umass.incident.observability.IncidentMetrics(registry, org.mockito.Mockito.mock(com.umass.incident.repository.IncidentRepository.class));
+        service = new EventProcessingService(repository, validators.getValidator(), Clock.fixed(NOW, ZoneOffset.UTC), correlation, metrics);
+    }
+
+    @Test
+    void directProcessingScopesTraceAndRestoresCallerContext() {
+        var input = event();
+        insert(input).thenReturn(1);
+        org.mockito.Mockito.doAnswer(call -> {
+            org.assertj.core.api.Assertions.assertThat(org.slf4j.MDC.get("traceId")).isEqualTo(input.traceId());
+            throw new IllegalStateException("not logged");
+        }).when(correlation).correlate(input);
+        org.slf4j.MDC.put("traceId", "caller");
+        try {
+            assertThatThrownBy(() -> service.process(input)).isInstanceOf(IllegalStateException.class);
+            org.assertj.core.api.Assertions.assertThat(org.slf4j.MDC.get("traceId")).isEqualTo("caller");
+        } finally { org.slf4j.MDC.clear(); }
     }
 
     @Test
@@ -67,6 +86,8 @@ class EventProcessingServiceTest {
         service.process(event);
 
         verify(correlation).correlate(event);
+        // An unproxied unit call cannot claim a database commit. The transaction-interceptor test covers success.
+        org.assertj.core.api.Assertions.assertThat(registry.get("incident.events.processed").counter().count()).isZero();
     }
 
     @ParameterizedTest
@@ -74,6 +95,7 @@ class EventProcessingServiceTest {
     void invalidEventIsRejectedBeforePersistence(ServiceEvent event) {
         assertThatThrownBy(() -> service.process(event)).isInstanceOf(InvalidServiceEventException.class);
         verifyNoInteractions(repository, correlation);
+        org.assertj.core.api.Assertions.assertThat(registry.get("incident.events.errors").counter().count()).isEqualTo(1);
     }
 
     @Test
@@ -82,6 +104,7 @@ class EventProcessingServiceTest {
         insert(event).thenThrow(new DataAccessResourceFailureException("PostgreSQL unavailable"));
 
         assertThatThrownBy(() -> service.process(event)).isInstanceOf(DataAccessResourceFailureException.class);
+        org.assertj.core.api.Assertions.assertThat(registry.get("incident.events.errors").counter().count()).isEqualTo(1);
         verifyNoInteractions(correlation);
     }
 
@@ -102,6 +125,7 @@ class EventProcessingServiceTest {
         doThrow(new IllegalStateException("Redis unavailable")).when(correlation).correlate(any());
 
         assertThatThrownBy(() -> service.process(event)).isInstanceOf(IllegalStateException.class);
+        org.assertj.core.api.Assertions.assertThat(registry.get("incident.events.errors").counter().count()).isEqualTo(1);
     }
 
     @Test
@@ -113,6 +137,8 @@ class EventProcessingServiceTest {
         service.process(event);
 
         verify(correlation, times(1)).correlate(event);
+        org.assertj.core.api.Assertions.assertThat(registry.get("incident.events.duplicates").counter().count()).isEqualTo(1);
+        org.assertj.core.api.Assertions.assertThat(registry.get("incident.events.errors").counter().count()).isZero();
     }
 
     private OngoingStubbing<Integer> insert(ServiceEvent event) {

@@ -82,7 +82,7 @@ class GatewayRoutingIntegrationTest {
     }
 
     @Test
-    void exposesOnlySanitizedGatewayHealth() throws Exception {
+    void exposesSanitizedGatewayHealth() throws Exception {
         var response = send("GET", "/actuator/health", "");
         assertThat(response.statusCode()).isEqualTo(200);
         assertThat(response.body()).contains("\"status\":\"UP\"").doesNotContain("\"components\"", "\"details\"");
@@ -91,7 +91,7 @@ class GatewayRoutingIntegrationTest {
 
     @ParameterizedTest
     @ValueSource(strings = {"/api/events-extra", "/api/incidents-extra", "/api/services-extra", "/api/analysis-extra",
-            "/simulate-extra", "/mcp", "/actuator", "/actuator/env", "/actuator/metrics", "/actuator/info",
+            "/simulate-extra", "/mcp", "/actuator", "/actuator/env", "/actuator/heapdump", "/actuator/loggers",
             "/actuator/configprops", "/actuator/gateway/routes", "/actuator/shutdown"})
     void doesNotExposeUnconfiguredPathsOrManagementEndpoints(String path) throws Exception {
         var response = send("GET", path, "");

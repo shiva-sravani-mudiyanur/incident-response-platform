@@ -41,6 +41,9 @@ server:
     include-stacktrace: never
     include-exception: false
 management:
+  metrics:
+    tags:
+      application: ${spring.application.name}
   endpoints:
     access:
       default: none
@@ -48,12 +51,22 @@ management:
       discovery:
         enabled: false
       exposure:
-        include: health
+        include: health,info,metrics,prometheus
     jmx:
       exposure:
         exclude: '*'
   endpoint:
+    info:
+      access: read-only
+    metrics:
+      access: read-only
+    prometheus:
+      access: read-only
     health:
       access: read-only
       show-details: never
       show-components: never
+logging:
+  structured:
+    format:
+      console: logstash

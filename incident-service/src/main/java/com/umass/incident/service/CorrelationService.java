@@ -27,33 +27,48 @@ public class CorrelationService {
     private final JdbcTemplate jdbc;
     private final Clock clock;
     private final CorrelationProperties properties;
+    private final com.umass.incident.observability.IncidentMetrics metrics;
 
     public CorrelationService(RedisFailureCounter counter, IncidentRepository repository, JdbcTemplate jdbc,
-                              Clock clock, CorrelationProperties properties) {
+                              Clock clock, CorrelationProperties properties, com.umass.incident.observability.IncidentMetrics metrics) {
         this.counter = counter;
         this.repository = repository;
         this.jdbc = jdbc;
         this.clock = clock;
         this.properties = properties;
+        this.metrics = metrics;
     }
 
     @Transactional
     public void correlate(ServiceEvent event) {
+        try (var trace = new com.umass.incident.observability.EventTraceScope(event == null ? null : event.traceId())) {
+            correlateInTrace(event);
+        }
+    }
+
+    private void correlateInTrace(ServiceEvent event) {
         if (event.severity() != EventSeverity.ERROR && event.severity() != EventSeverity.CRITICAL) return;
         var snapshot = counter.record(event);
+        log.atInfo().addKeyValue("eventId", event.eventId()).addKeyValue("errorCount", snapshot.count())
+                .addKeyValue("threshold", properties.threshold()).log("Correlation window evaluated");
         if (snapshot.count() < properties.threshold()) return;
 
         // Serialize the check/create across application instances, until PostgreSQL commit.
         // A JVM lock or an expiring Redis guard alone would not protect this transaction.
         jdbc.query("select pg_advisory_xact_lock(hashtextextended(?, 0))", (RowCallbackHandler) row -> { },
                 "incident-correlation:" + event.serviceName());
-        if (repository.existsByRootServiceAndStatusIn(event.serviceName(), ACTIVE_STATUSES)) return;
+        if (repository.existsByRootServiceAndStatusIn(event.serviceName(), ACTIVE_STATUSES)) {
+            log.atInfo().addKeyValue("eventId", event.eventId()).log("Automatic incident suppressed by active incident");
+            return;
+        }
         var severity = snapshot.hasCritical() ? IncidentSeverity.CRITICAL : IncidentSeverity.HIGH;
         var incident = new Incident(UUID.randomUUID(),
                 "Elevated error rate detected in " + event.serviceName(), severity, event.serviceName(),
                 Math.toIntExact(snapshot.count()), clock.instant().truncatedTo(ChronoUnit.MICROS));
         repository.save(incident);
-        log.info("Correlated incident id={} rootService={} severity={} errorCount={}", incident.getId(),
-                event.serviceName().replace('\r', '_').replace('\n', '_'), severity, snapshot.count());
+        metrics.created("correlation");
+        log.atInfo().addKeyValue("incidentId", incident.getId()).addKeyValue("eventId", event.eventId())
+                .addKeyValue("severity", severity).addKeyValue("errorCount", snapshot.count())
+                .log("Automatic incident creation prepared for commit");
     }
 }

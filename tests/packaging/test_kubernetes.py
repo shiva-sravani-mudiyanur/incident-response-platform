@@ -181,7 +181,9 @@ class KubernetesContractTest(unittest.TestCase):
                 explicit = {entry['name']: entry.get('value') for entry in container['env']}
                 self.assertEqual(explicit.get('MANAGEMENT_ENDPOINT_HEALTH_PROBES_ENABLED'), 'true')
                 self.assertEqual(env['MANAGEMENT_ENDPOINT_HEALTH_ACCESS'], 'read-only')
-                self.assertEqual(env['MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_INCLUDE'], 'health')
+                self.assertEqual(env['MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_INCLUDE'], 'health,info,metrics,prometheus')
+                for endpoint in ('INFO', 'METRICS', 'PROMETHEUS'):
+                    self.assertEqual(env['MANAGEMENT_ENDPOINT_' + endpoint + '_ACCESS'], 'read-only')
                 self.assertEqual(env['MANAGEMENT_ENDPOINTS_ACCESS_DEFAULT'], 'none')
                 self.assertEqual(env['MANAGEMENT_ENDPOINT_HEALTH_GROUP_LIVENESS_INCLUDE'], 'livenessState')
                 readiness = 'readinessState,db,redis' if name == 'incident-service' else 'readinessState'

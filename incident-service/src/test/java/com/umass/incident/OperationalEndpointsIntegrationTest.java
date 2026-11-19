@@ -79,7 +79,9 @@ class OperationalEndpointsIntegrationTest {
                 "--DB_NAME=" + postgres.getDatabaseName(), "--DB_USERNAME=" + postgres.getUsername(),
                 "--DB_PASSWORD=" + postgres.getPassword(),
                 // Isolate health's five-error DOWN threshold from automatic HIGH incident creation.
-                "--incident.correlation.threshold=100");
+                "--incident.correlation.threshold=100",
+                // Native Windows JDK CPU-load calls can block a scrape; keep this test about business meters.
+                "--management.metrics.enable.system.cpu=false", "--management.metrics.enable.process.cpu=false");
         processing = application.getBean(EventProcessingService.class);
         mapper = application.getBean(ObjectMapper.class);
         baseUrl = "http://127.0.0.1:" + application.getEnvironment().getRequiredProperty("local.server.port");
@@ -104,11 +106,19 @@ class OperationalEndpointsIntegrationTest {
     }
 
     @Test
-    void actuatorPublishesOnlyReadOnlyHealthInfoAndMetrics() throws Exception {
+    void actuatorPublishesOnlyReadOnlyHealthInfoMetricsAndPrometheus() throws Exception {
         // Boot may advertise liveness/readiness group names without disclosing component details.
         assertThat(json(get("/actuator/health"))).containsEntry("status", "UP")
                 .doesNotContainKeys("components", "details");
         assertThat(json(get("/actuator/info"))).isEmpty();
+        var prometheus = get("/actuator/prometheus");
+        assertThat(prometheus.statusCode()).isEqualTo(200);
+        assertThat(prometheus.body()).contains("incident_events_processed_total{application=\"incident-service\"}",
+                "incident_events_duplicates_total{application=\"incident-service\"}",
+                "incident_events_errors_total{application=\"incident-service\"}",
+                "incident_incidents_total{application=\"incident-service\",source=\"manual\"}",
+                "incident_incidents_total{application=\"incident-service\",source=\"correlation\"}",
+                "incident_incidents_active{application=\"incident-service\"}");
         Map<String, Object> metrics = json(get("/actuator/metrics"));
         assertThat(metrics).containsOnlyKeys("names");
         assertThat(((List<?>) metrics.get("names")).contains("jvm.memory.used")).isTrue();
@@ -116,10 +126,10 @@ class OperationalEndpointsIntegrationTest {
                 .containsEntry("name", "jvm.memory.used").containsKeys("measurements", "availableTags");
         assertThat(application.getBean(WebEndpointsSupplier.class).getEndpoints())
                 .extracting(endpoint -> endpoint.getEndpointId().toString())
-                .containsExactlyInAnyOrder("health", "info", "metrics");
+                .containsExactlyInAnyOrder("health", "info", "metrics", "prometheus");
         var environment = application.getEnvironment();
         assertThat(environment.getProperty("management.endpoints.access.default")).isEqualTo("none");
-        for (String endpoint : List.of("health", "info", "metrics")) {
+        for (String endpoint : List.of("health", "info", "metrics", "prometheus")) {
             assertThat(environment.getProperty("management.endpoint." + endpoint + ".access")).isEqualTo("read-only");
             assertThat(request("POST", "/actuator/" + endpoint).statusCode()).isIn(404, 405);
         }
@@ -129,7 +139,7 @@ class OperationalEndpointsIntegrationTest {
 
     @ParameterizedTest
     @ValueSource(strings = {"env", "configprops", "beans", "mappings", "loggers", "heapdump",
-            "threaddump", "shutdown", "prometheus", "conditions", "flyway", "scheduledtasks", "caches"})
+            "threaddump", "shutdown", "conditions", "flyway", "scheduledtasks", "caches"})
     void sensitiveActuatorEndpointsAreNotExposed(String endpoint) throws Exception {
         assertThat(get("/actuator/" + endpoint).statusCode()).isIn(404, 405);
         if (endpoint.equals("shutdown") || endpoint.equals("loggers")) {

@@ -109,6 +109,27 @@ class ComposeContractTest(unittest.TestCase):
         self.assertEqual(self.services['postgres']['volumes'][0]['source'], 'postgres_data')
         self.assertEqual(self.services['kafka']['volumes'][0]['source'], 'kafka_data')
 
+    def test_observers_are_isolated_from_business_dependencies_and_use_persistent_data(self):
+        for name, internal in [('prometheus', 9090), ('grafana', 3000)]:
+            self.assertIn(name, self.services, name + ' must start through Compose')
+            service = self.services[name]
+            self.assertTrue(service['read_only'])
+            self.assertTrue(service['healthcheck']['test'])
+            self.assertIn('ALL', service['cap_drop'])
+            self.assertTrue(all(port['host_ip'] == '127.0.0.1' for port in service['ports']))
+            self.assertEqual(service['ports'][0]['target'], internal)
+            mounts = service['volumes']
+            self.assertTrue(any(mount['type'] == 'volume' for mount in mounts))
+            self.assertTrue(all(mount.get('read_only') for mount in mounts if mount['type'] == 'bind'))
+        for name in APPS:
+            self.assertFalse({'prometheus', 'grafana'}.intersection(self.services[name].get('depends_on', {})))
+        grafana = self.services['grafana']
+        self.assertIn('GF_SECURITY_ADMIN_PASSWORD:?', grafana['entrypoint'][-1])
+        self.assertIn('exec /run.sh', grafana['entrypoint'][-1])
+        for name, service in self.services.items():
+            if name != 'grafana':
+                self.assertNotIn('GF_SECURITY_ADMIN_PASSWORD', service.get('environment', {}))
+
     def test_ai_refuses_empty_external_credentials_before_java_starts(self):
         entrypoint = self.services['ai-analysis-service'].get('entrypoint', [])
         self.assertTrue(entrypoint, 'AI needs fail-fast external key/model validation')

@@ -95,6 +95,26 @@ class IncidentPersistenceIntegrationTest {
     }
 
     @Test
+    void activeGaugeCountsGlobalCommittedOpenAndInvestigatingButNeverResolved() {
+        var gauge = application.getBean(io.micrometer.core.instrument.MeterRegistry.class)
+                .get("incident.incidents.active").gauge();
+        double baseline = gauge.value();
+        var service = application.getBean(IncidentService.class);
+        var first = service.createIncident(new com.umass.incident.dto.CreateIncidentRequest(
+                "Gauge fixture", IncidentSeverity.HIGH, "first-gauge-service", 1));
+        createdIds.add(first.id());
+        var second = service.createIncident(new com.umass.incident.dto.CreateIncidentRequest(
+                "Gauge fixture", IncidentSeverity.LOW, "other-gauge-service", 1));
+        createdIds.add(second.id());
+        service.updateStatus(second.id(), IncidentStatus.INVESTIGATING);
+        assertThat(gauge.value()).isEqualTo(baseline + 2);
+        service.updateStatus(first.id(), IncidentStatus.RESOLVED);
+        assertThat(gauge.value()).isEqualTo(baseline + 1);
+        service.updateStatus(second.id(), IncidentStatus.RESOLVED);
+        assertThat(gauge.value()).isEqualTo(baseline);
+    }
+
+    @Test
     void flywayMigrationRunsAgainstPostgresql() {
         JdbcTemplate jdbc = application.getBean(JdbcTemplate.class);
         assertThat(jdbc.queryForObject(

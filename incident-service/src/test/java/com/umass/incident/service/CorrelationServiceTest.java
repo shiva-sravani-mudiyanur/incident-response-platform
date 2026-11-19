@@ -39,11 +39,28 @@ class CorrelationServiceTest {
     @Mock private IncidentRepository repository;
     @Mock private JdbcTemplate jdbc;
     private CorrelationService service;
+    private final io.micrometer.core.instrument.simple.SimpleMeterRegistry registry = new io.micrometer.core.instrument.simple.SimpleMeterRegistry();
+    private com.umass.incident.observability.IncidentMetrics metrics;
 
     @BeforeEach
     void setUp() {
+        metrics = new com.umass.incident.observability.IncidentMetrics(registry, repository);
         service = new CorrelationService(counter, repository, jdbc, Clock.fixed(NOW, ZoneOffset.UTC),
-                new CorrelationProperties(5, 60));
+                new CorrelationProperties(5, 60), metrics);
+    }
+
+    @Test
+    void directCorrelationScopesNullTraceAndRestoresCallerEvenOnFailure() {
+        when(counter.record(any())).thenAnswer(call -> {
+            assertThat(org.slf4j.MDC.get("traceId")).isNull();
+            throw new IllegalStateException("not logged");
+        });
+        org.slf4j.MDC.put("traceId", "caller");
+        try {
+            assertThatThrownBy(() -> service.correlate(event("order-service", EventSeverity.ERROR)))
+                    .isInstanceOf(IllegalStateException.class);
+            assertThat(org.slf4j.MDC.get("traceId")).isEqualTo("caller");
+        } finally { org.slf4j.MDC.clear(); }
     }
 
     @ParameterizedTest
@@ -54,6 +71,20 @@ class CorrelationServiceTest {
         service.correlate(event("order-service", EventSeverity.ERROR));
 
         verifyNoInteractions(repository, jdbc);
+    }
+
+    @Test
+    void correlationCreateIsCountedOnlyWhenItsTransactionCommits() {
+        when(counter.record(any())).thenReturn(new RedisFailureCounter.WindowSnapshot(5, false));
+        org.springframework.transaction.support.TransactionSynchronizationManager.initSynchronization();
+        org.springframework.transaction.support.TransactionSynchronizationManager.setActualTransactionActive(true);
+        try {
+            service.correlate(event("order-service", EventSeverity.ERROR));
+            assertThat(registry.get("incident.incidents.created").tag("source", "correlation").counter().count()).isZero();
+            org.springframework.transaction.support.TransactionSynchronizationManager.getSynchronizations()
+                    .forEach(org.springframework.transaction.support.TransactionSynchronization::afterCommit);
+            assertThat(registry.get("incident.incidents.created").tag("source", "correlation").counter().count()).isEqualTo(1);
+        } finally { org.springframework.transaction.support.TransactionSynchronizationManager.clear(); }
     }
 
     @Test
@@ -124,7 +155,7 @@ class CorrelationServiceTest {
     @Test
     void configuredThresholdAndObservedCountAreUsed() {
         service = new CorrelationService(counter, repository, jdbc, Clock.fixed(NOW, ZoneOffset.UTC),
-                new CorrelationProperties(3, 10));
+                new CorrelationProperties(3, 10), metrics);
         when(counter.record(any())).thenReturn(new RedisFailureCounter.WindowSnapshot(4, false));
 
         service.correlate(event("order-service", EventSeverity.ERROR));

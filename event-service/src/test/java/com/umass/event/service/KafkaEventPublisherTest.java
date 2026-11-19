@@ -30,7 +30,7 @@ class KafkaEventPublisherTest {
         ServiceEvent event = event();
         when(template.send("service-events", event.serviceName(), event))
                 .thenReturn(CompletableFuture.completedFuture(null));
-        var publisher = new KafkaEventPublisher(template, "service-events", Duration.ofSeconds(1));
+        var publisher = new KafkaEventPublisher(template, "service-events", Duration.ofSeconds(1), new EventMetrics(new io.micrometer.core.instrument.simple.SimpleMeterRegistry()));
 
         publisher.publish(event);
 
@@ -48,7 +48,7 @@ class KafkaEventPublisherTest {
         ServiceEvent event = event();
         when(template.send("service-events", event.serviceName(), event))
                 .thenReturn(CompletableFuture.failedFuture(new IllegalStateException("Broker unavailable")));
-        var publisher = new KafkaEventPublisher(template, "service-events", Duration.ofSeconds(1));
+        var publisher = new KafkaEventPublisher(template, "service-events", Duration.ofSeconds(1), new EventMetrics(new io.micrometer.core.instrument.simple.SimpleMeterRegistry()));
 
         assertThatThrownBy(() -> publisher.publish(event)).isInstanceOf(EventPublishException.class);
     }
@@ -58,7 +58,7 @@ class KafkaEventPublisherTest {
         ServiceEvent event = event();
         when(template.send("service-events", event.serviceName(), event))
                 .thenThrow(new IllegalStateException("Metadata unavailable"));
-        var publisher = new KafkaEventPublisher(template, "service-events", Duration.ofSeconds(1));
+        var publisher = new KafkaEventPublisher(template, "service-events", Duration.ofSeconds(1), new EventMetrics(new io.micrometer.core.instrument.simple.SimpleMeterRegistry()));
 
         assertThatThrownBy(() -> publisher.publish(event)).isInstanceOf(EventPublishException.class);
     }
@@ -67,7 +67,7 @@ class KafkaEventPublisherTest {
     void unconfirmedPublicationTimesOut() {
         ServiceEvent event = event();
         when(template.send("service-events", event.serviceName(), event)).thenReturn(new CompletableFuture<>());
-        var publisher = new KafkaEventPublisher(template, "service-events", Duration.ofMillis(10));
+        var publisher = new KafkaEventPublisher(template, "service-events", Duration.ofMillis(10), new EventMetrics(new io.micrometer.core.instrument.simple.SimpleMeterRegistry()));
 
         assertThatThrownBy(() -> publisher.publish(event)).isInstanceOf(EventPublishException.class);
     }
@@ -76,7 +76,7 @@ class KafkaEventPublisherTest {
     void interruptionIsReportedAndInterruptFlagRestored() {
         ServiceEvent event = event();
         when(template.send("service-events", event.serviceName(), event)).thenReturn(new CompletableFuture<>());
-        var publisher = new KafkaEventPublisher(template, "service-events", Duration.ofSeconds(1));
+        var publisher = new KafkaEventPublisher(template, "service-events", Duration.ofSeconds(1), new EventMetrics(new io.micrometer.core.instrument.simple.SimpleMeterRegistry()));
         try {
             Thread.currentThread().interrupt();
             assertThatThrownBy(() -> publisher.publish(event)).isInstanceOf(EventPublishException.class);

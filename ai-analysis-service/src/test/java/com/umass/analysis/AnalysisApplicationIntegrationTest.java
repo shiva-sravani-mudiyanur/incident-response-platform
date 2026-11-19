@@ -51,7 +51,10 @@ class AnalysisApplicationIntegrationTest {
         application = new SpringApplicationBuilder(Class.forName("com.umass.analysis.AiAnalysisServiceApplication"), Mocks.class)
                 .run("--server.port=0", "--server.address=127.0.0.1", "--spring.ai.model.chat=none",
                         "--spring.ai.openai.chat.api-key=", "--spring.ai.openai.chat.model=mock-model-never-called",
-                        "--DIAGNOSTICS_MCP_BASE_URL=http://127.0.0.1:1");
+                        "--DIAGNOSTICS_MCP_BASE_URL=http://127.0.0.1:1",
+                        // Native Windows JDK CPU gauges can block in OperatingSystemImpl.getCpuLoad0.
+                        // Keep this HTTP fixture deterministic; production metric configuration is unchanged.
+                        "--management.metrics.enable.system.cpu=false", "--management.metrics.enable.process.cpu=false");
         model = application.getBean(ChatModel.class);
         gateway = application.getBean(DiagnosticsGateway.class);
         mapper = application.getBean(ObjectMapper.class);
@@ -152,6 +155,49 @@ class AnalysisApplicationIntegrationTest {
                 HttpResponse.BodyHandlers.ofString());
         assertThat(response.statusCode()).isEqualTo(200);
         assertThat(data(response.body())).containsEntry("status", "UP");
+    }
+
+    @Test
+    void exposesOnlyRequestedReadOnlyActuatorAllowlist() throws Exception {
+        var environment = application.getEnvironment();
+        assertThat(environment.getProperty("management.endpoints.access.default")).isEqualTo("none");
+        assertThat(environment.getProperty("management.endpoints.web.exposure.include")).isEqualTo("health,info,metrics,prometheus");
+        assertThat(environment.getProperty("logging.structured.format.console")).isEqualTo("logstash");
+        assertThat(environment.getProperty("management.metrics.tags.application")).isEqualTo("ai-analysis-service");
+        for (String endpoint : List.of("health", "info", "metrics", "prometheus")) {
+            assertThat(environment.getProperty("management.endpoint." + endpoint + ".access")).isEqualTo("read-only");
+            assertThat(get("/actuator/" + endpoint).statusCode()).as(endpoint).isEqualTo(200);
+            var write = http.send(HttpRequest.newBuilder(URI.create(origin + "/actuator/" + endpoint))
+                    .POST(HttpRequest.BodyPublishers.noBody()).build(), HttpResponse.BodyHandlers.ofString());
+            assertThat(write.statusCode()).as("write " + endpoint).isEqualTo(405);
+        }
+        for (String endpoint : List.of("", "/env", "/configprops", "/beans", "/loggers", "/mappings", "/heapdump", "/threaddump", "/shutdown")) {
+            assertThat(get("/actuator" + endpoint).statusCode()).as(endpoint).isEqualTo(404);
+        }
+        verifyNoInteractions(model, gateway);
+    }
+
+    @Test
+    void prometheusExportsAnalysisOutcomesWithOnlyApplicationAndOutcomeTags() throws Exception {
+        assertThat(post(incidentId).statusCode()).isEqualTo(200);
+        assertThat(post("invalid").statusCode()).isEqualTo(400);
+        var response = get("/actuator/prometheus");
+        assertThat(response.statusCode()).isEqualTo(200);
+        assertThat(response.body()).contains("analysis_duration_seconds_count", "analysis_duration_seconds_sum",
+                "analysis_requests_total", "analysis_errors_total", "outcome=\"success\"", "outcome=\"error\"");
+        var samples = response.body().lines().filter(line -> line.startsWith("analysis_")).toList();
+        assertThat(samples).isNotEmpty().allSatisfy(line -> {
+            assertThat(line).contains("application=\"ai-analysis-service\"").doesNotContain(incidentId, "order-service", "test-trace");
+            String labels = line.substring(line.indexOf('{') + 1, line.indexOf('}'));
+            assertThat(java.util.Arrays.stream(labels.split(",")).map(label -> label.substring(0, label.indexOf('='))).toList())
+                    .containsExactlyInAnyOrder("application", "outcome");
+        });
+        verify(model).call(any(Prompt.class));
+    }
+
+    private HttpResponse<String> get(String path) throws Exception {
+        return http.send(HttpRequest.newBuilder(URI.create(origin + path)).timeout(Duration.ofSeconds(10)).GET().build(),
+                HttpResponse.BodyHandlers.ofString());
     }
 
     private String validDraft() {

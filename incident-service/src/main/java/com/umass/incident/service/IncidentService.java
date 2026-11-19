@@ -18,16 +18,22 @@ import java.util.List;
 public class IncidentService {
     private final IncidentRepository repository;
     private final Clock clock;
+    private final com.umass.incident.observability.IncidentMetrics metrics;
+    private static final org.slf4j.Logger log = org.slf4j.LoggerFactory.getLogger(IncidentService.class);
 
-    public IncidentService(IncidentRepository repository, Clock clock) {
+    public IncidentService(IncidentRepository repository, Clock clock, com.umass.incident.observability.IncidentMetrics metrics) {
         this.repository = repository;
         this.clock = clock;
+        this.metrics = metrics;
     }
 
     public IncidentResponse createIncident(CreateIncidentRequest request) {
         Incident incident = new Incident(UUID.randomUUID(), request.title(), request.severity(),
                 request.rootService(), request.errorCount(), clock.instant().truncatedTo(ChronoUnit.MICROS));
-        return IncidentResponse.from(repository.save(incident));
+        var saved = repository.save(incident);
+        metrics.created("manual");
+        log.atInfo().addKeyValue("incidentId", saved.getId()).log("Manual incident creation prepared for commit");
+        return IncidentResponse.from(saved);
     }
 
     @Transactional(readOnly = true)

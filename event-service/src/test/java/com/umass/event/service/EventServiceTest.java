@@ -34,7 +34,7 @@ class EventServiceTest {
 
     @BeforeEach
     void setUp() {
-        service = new EventService(publisher);
+        service = new EventService(publisher, new EventMetrics(new io.micrometer.core.instrument.simple.SimpleMeterRegistry()));
     }
 
     @Test
@@ -63,7 +63,8 @@ class EventServiceTest {
             var event = new ServiceEvent(null, "payment-service", EventType.REQUEST_FAILED,
                     EventSeverity.ERROR, "Failure", Instant.parse("2026-11-16T12:00:00Z"), null, null);
             assertThatThrownBy(() -> service.accept(event)).isInstanceOf(EventPublishException.class);
-            assertThat(appender.list).isEmpty();
+            assertThat(appender.list).singleElement().satisfies(entry ->
+                    assertThat(entry.getFormattedMessage()).isEqualTo("Received event"));
         } finally {
             logger.detachAppender(appender);
             appender.stop();
@@ -133,9 +134,13 @@ class EventServiceTest {
 
             assertThat(appender.list).singleElement().satisfies(entry -> {
                 assertThat(entry.getLevel()).isEqualTo(Level.INFO);
-                assertThat(entry.getFormattedMessage()).contains("Accepted event", accepted.eventId().toString(),
-                                "payment__service", "DATABASE_ERROR", "ERROR")
-                        .doesNotContain("sensitive-message", "sensitive-metadata", "sensitive-trace", "\r", "\n");
+                assertThat(entry.getFormattedMessage()).isEqualTo("Received event");
+                assertThat(entry.getKeyValuePairs()).extracting(pair -> pair.key)
+                        .containsExactly("eventId", "serviceName");
+                assertThat(entry.getKeyValuePairs()).extracting(pair -> pair.value)
+                        .containsExactly(accepted.eventId(), "payment\r\nservice");
+                assertThat(entry.getFormattedMessage()).doesNotContain(
+                        "sensitive-message", "sensitive-metadata", "sensitive-trace", "\r", "\n");
             });
         } finally {
             logger.detachAppender(appender);

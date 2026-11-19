@@ -31,10 +31,27 @@ class IncidentServiceTest {
     @Mock
     private IncidentRepository repository;
     private IncidentService service;
+    private final io.micrometer.core.instrument.simple.SimpleMeterRegistry registry = new io.micrometer.core.instrument.simple.SimpleMeterRegistry();
+    private com.umass.incident.observability.IncidentMetrics metrics;
 
     @BeforeEach
     void setUp() {
-        service = new IncidentService(repository, Clock.fixed(NOW, ZoneOffset.UTC));
+        metrics = new com.umass.incident.observability.IncidentMetrics(registry, repository);
+        service = new IncidentService(repository, Clock.fixed(NOW, ZoneOffset.UTC), metrics);
+    }
+
+    @Test
+    void manualCreateIsCountedOnlyWhenItsTransactionCommits() {
+        when(repository.save(any(Incident.class))).thenAnswer(invocation -> invocation.getArgument(0));
+        org.springframework.transaction.support.TransactionSynchronizationManager.initSynchronization();
+        org.springframework.transaction.support.TransactionSynchronizationManager.setActualTransactionActive(true);
+        try {
+            service.createIncident(new CreateIncidentRequest("not logged", IncidentSeverity.HIGH, "payment-service", 5));
+            assertThat(registry.get("incident.incidents.created").tag("source", "manual").counter().count()).isZero();
+            org.springframework.transaction.support.TransactionSynchronizationManager.getSynchronizations()
+                    .forEach(org.springframework.transaction.support.TransactionSynchronization::afterCommit);
+            assertThat(registry.get("incident.incidents.created").tag("source", "manual").counter().count()).isEqualTo(1);
+        } finally { org.springframework.transaction.support.TransactionSynchronizationManager.clear(); }
     }
 
     @Test
@@ -132,7 +149,7 @@ class IncidentServiceTest {
     void timestampsUsePostgresqlMicrosecondPrecision() {
         Instant preciseNow = Instant.parse("2026-11-15T12:00:00.123456789Z");
         Instant databaseNow = Instant.parse("2026-11-15T12:00:00.123456Z");
-        service = new IncidentService(repository, Clock.fixed(preciseNow, ZoneOffset.UTC));
+        service = new IncidentService(repository, Clock.fixed(preciseNow, ZoneOffset.UTC), metrics);
         when(repository.save(any(Incident.class))).thenAnswer(invocation -> invocation.getArgument(0));
 
         var created = service.createIncident(new CreateIncidentRequest("Failure",

@@ -15,6 +15,59 @@ A portfolio-focused distributed incident response platform. The intended system 
 
 All six modules use Java 21 and Spring Boot 4.0.9, inherited from the root Maven POM. Each runs as its own application: native mode uses separate terminals, while Stage 13 Compose mode runs them as separate containers. SERVER_PORT can override its default port. Stage 4 connects event-service and incident-service through Kafka and persists incident_events asynchronously. Stage 5 adds Redis-backed failure correlation and deterministic automatic incident creation without an LLM. Stage 7 adds an HTTP-only scenario generator; it does not implement detection or access Kafka, Redis, PostgreSQL, or the incident API directly. Stage 8 adds operational health/history APIs; Stage 9 exposes five read-only MCP tools backed only by those REST APIs and the existing incident API. Stage 10 adds a separate OpenAI-backed analysis service that reads diagnostics through MCP only; detection remains deterministic. Stage 11 adds an optional API gateway on loopback port 8081 as one convenient client entry point; existing services and their internal communication remain independent. Stage 12 adds bounded resilience only to diagnostics REST GETs and scoped AI MCP diagnostic reads, without gateway or model retries.
 
+## Stage 16: minimal observability
+
+The existing six Spring Boot services now expose Micrometer application/JVM/HTTP metrics. Prometheus and Grafana run alongside them in Compose; neither is a dependency of the processing pipeline. No detection rules, Kafka topology, Redis behavior, MCP/model flow, API contracts, gateway routes or framework versions are changed.
+
+```text
+Spring Boot services → Micrometer → /actuator/prometheus → Prometheus → Grafana
+```
+
+All six services allow only read-only `/actuator/health`, `/actuator/info`, `/actuator/metrics` and `/actuator/prometheus`. Sensitive Actuator endpoints and JMX/discovery remain disabled. Metrics include a fixed `application` tag; event/trace/incident IDs and dynamic service names are never custom metric labels. Console logs use Boot's Logstash JSON format. Important event receipt, Kafka publishing/consumption, processing, correlation and automatic incident creation logs carry the original ServiceEvent `traceId` in scoped MDC; the context is restored after success or failure. Event messages, metadata, prompts and credentials are not logged by this instrumentation. This is log correlation, not a new distributed-tracing platform.
+
+Default local URLs (host ports are configurable):
+
+| Component | URL |
+| --- | --- |
+| Prometheus UI / targets | http://127.0.0.1:9090 / http://127.0.0.1:9090/targets |
+| Grafana | http://127.0.0.1:3000 |
+| Provisioned dashboard | http://127.0.0.1:3000/d/incident-response |
+| Incident metrics example | http://127.0.0.1:8080/actuator/prometheus |
+
+From a free Windows PowerShell terminal at the project root:
+
+```powershell
+Set-Location 'C:\Users\Shiva Sravani\Desktop\incident-response'
+# Keep your existing .env. Add GRAFANA_ADMIN_PASSWORD locally; never share it.
+# A complete stack also needs the existing DB_* and OPENAI_API_KEY/OPENAI_MODEL settings.
+notepad.exe .env
+docker compose up -d --build --wait --wait-timeout 300
+docker compose ps
+```
+
+Use these commands only for the intended Compose project and free host ports. If another native/Compose stack is already using those ports, keep it running and select a separate project plus an ignored host-port override file, as described in [the observability guide](observability/README.md). Do not point a second test consumer at the original broker/database.
+
+Prometheus scrapes the six applications directly by container DNS/internal port every 15 seconds with a 5-second timeout; it does not scrape through gateway routes or require the host's published application ports. Configuration is in `observability/prometheus/prometheus.yml`. Grafana's provisioned `Prometheus` datasource uses `http://prometheus:9090`; its datasource/provider YAML and one dashboard JSON live under `observability/grafana/`. No manual datasource import is needed. Prometheus history (7-day retention) and Grafana state use separate named volumes. Grafana requires an externally supplied admin password and anonymous access is disabled; existing volumes retain their original admin account/password.
+
+Custom metrics (Micrometer names; Prometheus translates dots to underscores, normalizes reserved suffixes, adds `_total` for counters and `_seconds_count`/`_seconds_sum` for timers). In particular, `incident.incidents.created` exports as `incident_incidents_total`, not `incident_incidents_created_total`:
+
+| Metric | Type | Meaning |
+| --- | --- | --- |
+| `event.received` | Counter | Valid ingestion attempts reaching event-service |
+| `event.published` / `event.publish.errors` | Counters | Confirmed Kafka publications / failed publish attempts |
+| `event.publish.duration` | Timer | Publish attempt duration, `outcome=success` or `error` |
+| `incident.events.processed` | Counter | Newly inserted events whose PostgreSQL transaction committed |
+| `incident.events.duplicates` / `incident.events.errors` | Counters | Duplicate deliveries / failed processing attempts |
+| `incident.events.processing` | Timer | Processing attempt duration including transaction completion; success/duplicate/error |
+| `incident.incidents.created` | Counter | Committed creations, `source=manual` or `correlation`; rolled-back inserts are excluded |
+| `incident.incidents.active` | Gauge | Current database-wide OPEN + INVESTIGATING count; a failed read is NaN, not zero |
+| `analysis.requests` / `analysis.errors` | Counters | Completed analysis attempts by success/error outcome / failed attempts |
+| `analysis.duration` | Timer | Whole analysis duration, including diagnostic reads, model rounds and failures |
+
+The seven dashboard panels show committed event processing rate, incident creations by running processes, current active incidents, processing/publish/analysis errors, mean event-processing latency, mean whole-analysis latency, and each Spring service's scrape health. Counter totals reset when a process restarts; rates handle those resets. The active gauge reads persistent state and uses `max`, not `sum`, because replicas share the same database. Latency panels show a gap when there are no observations, not fabricated zero latency. Scrape UP is not proof that a real model call will succeed. Metrics scraping never invokes the model.
+
+See [the observability guide](observability/README.md) for panel meanings, configuration, safe scenario/AI verification and troubleshooting; [Stage 16 verification](docs/stage16-verification.md) records actual execution results. The only Kubernetes manifest change is the shared Actuator allowlist; the existing cluster is not rebuilt/redeployed as part of this Compose verification.
+
 ## Stage 15: demonstrate Kubernetes HTTP balancing
 
 Incident-service exposes read-only `GET /api/instance`, returning `serviceName`, the natural OS `hostname` (the pod name in this Kubernetes deployment), and a fresh UTC `timestamp`. The thin controller returns a DTO with `Cache-Control: no-store`; no load-balancing algorithm or HTTP session state is implemented in Java. Two incident replicas sit behind the existing Kubernetes Service with `sessionAffinity: None`.
@@ -52,7 +105,8 @@ The Maven parent is named `incident-response-platform`. The existing checkout di
 
 ```text
 pom.xml                         Maven parent and module list
-docker-compose.yml              Full six-application stack plus PostgreSQL, Kafka, Redis, topic init
+docker-compose.yml              Six applications, infrastructure, Prometheus and Grafana
+observability/                  Prometheus config and provisioned Grafana datasource/dashboard
 Dockerfile                      Shared Java 21 multi-stage build selected by MODULE
 .dockerignore                   Allowlisted source context; no credentials or local builds
 docker/healthcheck.sh            Bounded container-local Actuator probe
@@ -118,7 +172,7 @@ api-gateway/
   .env.example                  Nonsecret destination URLs and gateway-local settings
   src/main/java/                Gateway application; no domain or infrastructure clients
   src/main/resources/
-    application.yaml            Config-driven routes, HTTP timeouts, loopback, health only
+    application.yaml            Config-driven routes, HTTP timeouts, restricted Actuator
   src/test/java/                Private loopback downstream stubs; no Docker or live providers
 ```
 
@@ -431,7 +485,7 @@ $accepted
 Invoke-RestMethod -Uri "$env:EVENT_API_BASE_URL/actuator/health"
 ```
 
-Expect HTTP 202, an eventId, an `Accepted event` entry in the event-service terminal with that ID, and health UP. In Postman, use POST to http://localhost:8082/api/events with Body > raw > JSON:
+Expect HTTP 202, an eventId, a `Published event` JSON entry in the event-service terminal with that ID, and health UP. Since Stage 16, receipt and confirmed publication are separate structured log messages. In Postman, use POST to http://localhost:8082/api/events with Body > raw > JSON:
 
 ```json
 {
@@ -473,7 +527,7 @@ Consumer auto-commit is disabled. RECORD acknowledgement commits after the trans
 
 After starting infrastructure and both services, post the event shown above and save the returned eventId. Then:
 
-1. Find `Accepted event eventId=...` in event-service and `Consumed event eventId=...` in incident-service. The latter is logged after the database transaction completes.
+1. Find a `Published event` JSON record in event-service and an `Event consumed` JSON record in incident-service with the same `eventId`. The latter is logged after the database transaction completes. Since Stage 16, both also carry the original `traceId` as a structured MDC field.
 2. Run these inspection commands in a terminal with the same complete Compose DB_* settings. All Compose commands interpolate the whole file, even when inspecting only Kafka:
 
 ```powershell
@@ -626,7 +680,7 @@ Allow time for asynchronous consumption. In a request terminal, inspect the exis
 curl.exe -i 'http://localhost:8080/api/incidents?status=OPEN'
 ```
 
-Match `rootService` to order-service, payment-service, or inventory-service, rather than counting all returned incidents. Match the simulator's exact eventIds to `Accepted event` logs in event-service and `Consumed event` logs in incident-service; use the existing Stage 4 database inspection to confirm the same event_id rows and their shared trace_id. The event-service and consumer logs intentionally do not print traceId. The simulator does not query these systems itself.
+Match `rootService` to order-service, payment-service, or inventory-service, rather than counting all returned incidents. Match the simulator's exact eventIds to `Published event` JSON logs in event-service and `Event consumed` JSON logs in incident-service; use the existing Stage 4 database inspection to confirm the same event_id rows and their shared trace_id. Since Stage 16, these logs also carry the original traceId in scoped MDC, without logging event messages or metadata. The simulator does not query these systems itself.
 
 With the default threshold of five, a fresh qualifying database wave can create a HIGH order-service incident; a payment wave can create a HIGH payment-service incident. With no pre-existing active incidents and clean correlation windows, a cascade can create **up to three per-root-service incidents**: CRITICAL for order-service and HIGH for payment-service and inventory-service. A shared traceId is evidence for inspection, **not implemented cross-service incident correlation**. INFO startup events do not contribute failures.
 
@@ -715,7 +769,7 @@ curl.exe -i http://localhost:8080/actuator/metrics
 curl.exe -i http://localhost:8080/actuator/metrics/jvm.memory.used
 ```
 
-The existing Actuator dependency is retained. Endpoint access defaults to none, with only health/info/metrics granted read-only access and included in the HTTP allowlist. JMX exposure and the `/actuator` discovery page are disabled. Health component details are hidden; Boot may still advertise nonsensitive liveness/readiness group names. Default info contributors are disabled, so `/actuator/info` returns an empty object rather than environment, build, Git, Java, or OS details.
+The existing Actuator dependency is retained. Endpoint access defaults to none, with health/info/metrics granted read-only access and included in the HTTP allowlist; Stage 16 adds the read-only `/actuator/prometheus` export on all six services. JMX exposure and the `/actuator` discovery page are disabled. Health component details are hidden; Boot may still advertise nonsensitive liveness/readiness group names. Default info contributors are disabled in incident-service, so `/actuator/info` returns an empty object rather than environment, build, Git, Java, or OS details.
 
 `/actuator/env`, `/actuator/configprops`, `/actuator/beans`, `/actuator/mappings`, `/actuator/loggers`, `/actuator/heapdump`, `/actuator/threaddump`, and `/actuator/shutdown` are not exposed. No wildcard HTTP exposure is configured. These development APIs remain unauthenticated: keep access on localhost/a trusted private network; this allowlist is not a substitute for production authentication and network controls.
 

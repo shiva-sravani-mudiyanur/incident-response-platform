@@ -27,13 +27,132 @@ class IncidentAnalysisServiceTest {
     DiagnosticsGateway.Session session;
     IncidentAnalysisService service;
     AnalysisProperties properties;
+    io.micrometer.core.instrument.simple.SimpleMeterRegistry registry;
+
+    @Test void recordsSuccessfulAnalysisOnceAfterMcpModelValidationAndSessionClose() {
+        preflight();
+        when(model.call(any(Prompt.class))).thenAnswer(invocation -> {
+            assertThat(registry.get("analysis.duration").tag("outcome", "success").timer().count()).isZero();
+            return answer(draft());
+        });
+        doAnswer(invocation -> {
+            assertThat(registry.get("analysis.duration").tag("outcome", "success").timer().count()).isZero();
+            return null;
+        }).when(session).close();
+
+        assertThat(service.analyze(ID).incidentId()).isEqualTo(ID);
+
+        var timer = registry.get("analysis.duration").tag("outcome", "success").timer();
+        assertThat(timer.count()).isEqualTo(1);
+        assertThat(timer.totalTime(java.util.concurrent.TimeUnit.NANOSECONDS)).isPositive();
+        assertThat(registry.get("analysis.requests").tag("outcome", "success").counter().count()).isEqualTo(1);
+        assertThat(registry.get("analysis.errors").counter().count()).isZero();
+        assertThat(registry.getMeters()).allSatisfy(meter ->
+                assertThat(meter.getId().getTags()).allSatisfy(tag -> {
+                    assertThat(tag.getKey()).isEqualTo("outcome");
+                    assertThat(tag.getValue()).isIn("success", "error");
+                }));
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings = {"invalid-id", "mcp-open", "mcp-read", "model", "validation", "close"})
+    void recordsEveryFailureOnceWithoutChangingExistingErrorContracts(String phase) {
+        preflight();
+        when(model.call(any(Prompt.class))).thenReturn(answer(draft()));
+        String requestedId = ID;
+        switch (phase) {
+            case "invalid-id" -> requestedId = "invalid";
+            case "mcp-open" -> when(gateway.open(ID)).thenThrow(new com.umass.analysis.exception.AnalysisException(
+                    org.springframework.http.HttpStatus.SERVICE_UNAVAILABLE, "DIAGNOSTICS_UNAVAILABLE", "private"));
+            case "mcp-read" -> when(session.call("get_incident", Map.of("incidentId", ID))).thenThrow(
+                    new com.umass.analysis.exception.AnalysisException(org.springframework.http.HttpStatus.NOT_FOUND, "NOT_FOUND", "private"));
+            case "model" -> when(model.call(any(Prompt.class))).thenThrow(new IllegalStateException("private"));
+            case "validation" -> when(model.call(any(Prompt.class))).thenReturn(answer("not JSON"));
+            case "close" -> doThrow(new com.umass.analysis.exception.AnalysisException(
+                    org.springframework.http.HttpStatus.SERVICE_UNAVAILABLE, "DIAGNOSTICS_UNAVAILABLE", "private")).when(session).close();
+        }
+        String id = requestedId;
+        int status = switch (phase) { case "invalid-id" -> 400; case "mcp-read" -> 404; case "validation" -> 502; default -> 503; };
+        String code = switch (phase) {
+            case "invalid-id" -> "INVALID_INCIDENT_ID";
+            case "mcp-read" -> "INCIDENT_NOT_FOUND";
+            case "model" -> "LLM_UNAVAILABLE";
+            case "validation" -> "INVALID_MODEL_RESPONSE";
+            default -> "DIAGNOSTICS_UNAVAILABLE";
+        };
+        assertError(() -> service.analyze(id), status, code);
+        assertThat(registry.get("analysis.duration").tag("outcome", "error").timer().count()).isEqualTo(1);
+        assertThat(registry.get("analysis.duration").tag("outcome", "error").timer()
+                .totalTime(java.util.concurrent.TimeUnit.NANOSECONDS)).isPositive();
+        assertThat(registry.get("analysis.requests").tag("outcome", "error").counter().count()).isEqualTo(1);
+        assertThat(registry.get("analysis.errors").tag("outcome", "error").counter().count()).isEqualTo(1);
+        assertThat(registry.get("analysis.duration").tag("outcome", "success").timer().count()).isZero();
+        assertThat(registry.getMeters()).allSatisfy(meter ->
+                assertThat(meter.getId().getTags()).allSatisfy(tag -> {
+                    assertThat(tag.getKey()).isEqualTo("outcome");
+                    assertThat(tag.getValue()).isIn("success", "error");
+                }));
+        if (phase.startsWith("mcp") || phase.equals("invalid-id")) verifyNoInteractions(model);
+    }
+
+    @Test void preservesUnexpectedExceptionIdentityAndStillRecordsFailure() {
+        var failure = new IllegalStateException("private gateway failure");
+        when(gateway.open(ID)).thenThrow(failure);
+        assertThatThrownBy(() -> service.analyze(ID)).isSameAs(failure);
+        assertThat(registry.get("analysis.duration").tag("outcome", "error").timer().count()).isEqualTo(1);
+        assertThat(registry.get("analysis.errors").tag("outcome", "error").counter().count()).isEqualTo(1);
+    }
+
+    @Test void differentIncidentIdsAndServicesDoNotCreateUniqueMetricTags() {
+        preflight();
+        String otherId = "d7f12739-2d47-416a-920c-68ee20165fa4";
+        when(gateway.open(otherId)).thenReturn(session);
+        when(session.call("get_incident", Map.of("incidentId", otherId)))
+                .thenReturn(Map.of("id", otherId, "rootService", "billing"));
+        when(session.call("get_related_events", Map.of("incidentId", otherId)))
+                .thenReturn(Map.of("events", List.of(Map.of("message", "private"))));
+        when(session.call("get_service_health", Map.of("serviceName", "billing")))
+                .thenReturn(Map.of("errorsLastMinute", 0));
+        when(model.call(any(Prompt.class))).thenReturn(answer(draft()), answer(draft().replace(ID, otherId)));
+        service.analyze(ID);
+        service.analyze(otherId);
+        assertThat(registry.getMeters()).hasSize(5).allSatisfy(meter ->
+                assertThat(meter.getId().getTags()).allSatisfy(tag -> {
+                    assertThat(tag.getKey()).isEqualTo("outcome");
+                    assertThat(tag.getValue()).isIn("success", "error");
+                }));
+        assertThat(registry.get("analysis.duration").tag("outcome", "success").timer().count()).isEqualTo(2);
+        assertThat(registry.get("analysis.requests").tag("outcome", "success").counter().count()).isEqualTo(2);
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {true, false})
+    void registryRecordingFailuresNeverReplaceBusinessResultOrOriginalError(boolean success) {
+        var brokenRegistry = mock(io.micrometer.core.instrument.MeterRegistry.class);
+        when(brokenRegistry.timer(anyString(), any(String[].class))).thenThrow(new IllegalStateException("registry timer"));
+        when(brokenRegistry.counter(anyString(), any(String[].class))).thenThrow(new IllegalStateException("registry counter"));
+        service = new IncidentAnalysisService(model, gateway, properties, JsonMapper.builder().build(), new AnalysisMetrics(brokenRegistry));
+        clearInvocations(brokenRegistry);
+        if (success) {
+            preflight();
+            when(model.call(any(Prompt.class))).thenReturn(answer(draft()));
+            assertThat(service.analyze(ID).incidentId()).isEqualTo(ID);
+        } else {
+            var failure = new IllegalStateException("original business failure");
+            when(gateway.open(ID)).thenThrow(failure);
+            assertThatThrownBy(() -> service.analyze(ID)).isSameAs(failure);
+            verify(brokenRegistry).counter("analysis.errors", "outcome", "error");
+        }
+        verify(brokenRegistry).counter("analysis.requests", "outcome", success ? "success" : "error");
+    }
 
     @BeforeEach void setup() {
+        registry = new io.micrometer.core.instrument.simple.SimpleMeterRegistry();
         model = mock(ChatModel.class);
         gateway = mock(DiagnosticsGateway.class);
         session = mock(DiagnosticsGateway.Session.class);
         properties = properties(3, 8, 64000, 16000);
-        service = new IncidentAnalysisService(model, gateway, properties, JsonMapper.builder().build());
+        service = new IncidentAnalysisService(model, gateway, properties, JsonMapper.builder().build(), new AnalysisMetrics(registry));
     }
 
     @Test void capturesMandatoryDiagnosticsBeforeSynthesizingServerOwnedEvidence() {
@@ -186,7 +305,7 @@ class IncidentAnalysisServiceTest {
 
     @Test void rejectsOversizedModelResponse() {
         preflight();
-        service = new IncidentAnalysisService(model, gateway, properties(3, 8, 64000, 1024), JsonMapper.builder().build());
+        service = new IncidentAnalysisService(model, gateway, properties(3, 8, 64000, 1024), JsonMapper.builder().build(), new AnalysisMetrics(registry));
         when(model.call(any(Prompt.class))).thenReturn(answer(draft().replace("A dependency may be failing.", "x".repeat(1100))));
         assertError(() -> service.analyze(ID), 502, "INVALID_MODEL_RESPONSE");
     }
@@ -215,7 +334,7 @@ class IncidentAnalysisServiceTest {
         preflight();
         when(session.call("get_related_events", Map.of("incidentId", ID)))
                 .thenReturn(Map.of("events", List.of(Map.of("message", "timeout")), "largeField", "x".repeat(5000)));
-        service = new IncidentAnalysisService(model, gateway, properties(3, 8, 1024, 16000), JsonMapper.builder().build());
+        service = new IncidentAnalysisService(model, gateway, properties(3, 8, 1024, 16000), JsonMapper.builder().build(), new AnalysisMetrics(registry));
         assertError(() -> service.analyze(ID), 503, "DIAGNOSTICS_UNAVAILABLE");
         verifyNoInteractions(model);
     }
@@ -289,7 +408,7 @@ class IncidentAnalysisServiceTest {
 
     @Test void rejectsToolContinuationPastRoundLimitWithoutExecutingIt() {
         preflight();
-        service = new IncidentAnalysisService(model, gateway, properties(1, 8, 64000, 16000), JsonMapper.builder().build());
+        service = new IncidentAnalysisService(model, gateway, properties(1, 8, 64000, 16000), JsonMapper.builder().build(), new AnalysisMetrics(registry));
         when(model.call(any(Prompt.class))).thenReturn(toolResponse(1), answer(draft()));
         assertError(() -> service.analyze(ID), 502, "INVALID_MODEL_RESPONSE");
         verify(model).call(any(Prompt.class));
@@ -298,7 +417,7 @@ class IncidentAnalysisServiceTest {
 
     @Test void rejectsWholeToolBatchExceedingRemainingCallBudget() {
         preflight();
-        service = new IncidentAnalysisService(model, gateway, properties(3, 4, 64000, 16000), JsonMapper.builder().build());
+        service = new IncidentAnalysisService(model, gateway, properties(3, 4, 64000, 16000), JsonMapper.builder().build(), new AnalysisMetrics(registry));
         when(model.call(any(Prompt.class))).thenReturn(toolResponse(2), answer(draft()));
         assertError(() -> service.analyze(ID), 502, "INVALID_MODEL_RESPONSE");
         verify(session, times(3)).call(any(), any());
