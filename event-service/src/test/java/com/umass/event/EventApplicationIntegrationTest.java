@@ -49,7 +49,8 @@ class EventApplicationIntegrationTest {
             admin.createTopics(List.of(new NewTopic("service-events", 1, (short) 1))).all().get(20, TimeUnit.SECONDS);
         }
         application = new SpringApplicationBuilder(EventServiceApplication.class).run("--server.port=0",
-                "--KAFKA_BOOTSTRAP_SERVERS=" + kafka.getBootstrapServers());
+                "--KAFKA_BOOTSTRAP_SERVERS=" + kafka.getBootstrapServers(),
+                "--KAFKA_EVENTS_TOPIC=service-events");
         mapper = application.getBean(ObjectMapper.class);
         client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).build();
         int port = ((WebServerApplicationContext) application).getWebServer().getPort();
@@ -137,6 +138,18 @@ class EventApplicationIntegrationTest {
         payload.put(field, 1);
 
         assertThat(post(mapper.writeValueAsString(payload)).statusCode()).isEqualTo(400);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"serviceName", "message", "traceId"})
+    void realHttpRejectsEmbeddedNul(String field) throws Exception {
+        var payload = payload();
+        payload.put(field, "before\0after");
+
+        var response = post(mapper.writeValueAsString(payload));
+
+        assertThat(response.statusCode()).isEqualTo(400);
+        assertThat(mapper.readTree(response.body()).get("errors").has(field)).isTrue();
     }
 
     @Test

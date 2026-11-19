@@ -29,8 +29,9 @@ The required Service policy is `spec.sessionAffinity: None` (no sticky sessions)
 Run from the repository root. Select the dedicated kubeconfig in **every new terminal**; do not overwrite or print its credentials.
 
 ```powershell
-Set-Location 'C:\Users\Shiva Sravani\Desktop\incident-response'
-$env:KUBECONFIG = 'C:\Users\Shiva Sravani\.kube\incident-response-stage14.yaml'
+# Replace this path with your actual checkout directory.
+Set-Location 'C:\path\to\incident-response'
+$env:KUBECONFIG = Join-Path $env:USERPROFILE '.kube\incident-response-stage14.yaml'
 $context = kubectl config current-context
 if ($LASTEXITCODE -ne 0 -or $context -ne 'kind-incident-response-stage14') {
     throw 'Wrong or unavailable context; stop and check the dedicated kubeconfig.'

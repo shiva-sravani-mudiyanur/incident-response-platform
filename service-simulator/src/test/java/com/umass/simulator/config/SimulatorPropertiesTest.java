@@ -52,6 +52,32 @@ class SimulatorPropertiesTest {
                 Duration.ZERO, Duration.ofSeconds(2), Duration.ZERO)).isInstanceOf(IllegalArgumentException.class);
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {"PT0.000000001S", "PT0.000999999S", "PT2147483.648S", "PT9223372036854775807S"})
+    void connectionTimeoutMustFitBoundedMillisecondClient(String timeout) {
+        assertThatThrownBy(() -> new SimulatorProperties(URI.create("http://event-service.test"), 5,
+                Duration.ZERO, Duration.parse(timeout), Duration.ofSeconds(15)))
+                .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("simulator.connect-timeout");
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"PT0.000000001S", "PT0.000999999S", "PT2147483.648S", "PT9223372036854775807S"})
+    void readTimeoutMustFitBoundedMillisecondClient(String timeout) {
+        assertThatThrownBy(() -> new SimulatorProperties(URI.create("http://event-service.test"), 5,
+                Duration.ZERO, Duration.ofSeconds(2), Duration.parse(timeout)))
+                .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("simulator.read-timeout");
+    }
+
+    @ParameterizedTest
+    @ValueSource(longs = {1, 2147483647})
+    void millisecondTimeoutBoundsRemainValid(long milliseconds) {
+        var timeout = Duration.ofMillis(milliseconds);
+        var configured = new SimulatorProperties(URI.create("http://event-service.test"), 5,
+                Duration.ZERO, timeout, timeout);
+        assertThat(configured.connectTimeout()).isEqualTo(timeout);
+        assertThat(configured.readTimeout()).isEqualTo(timeout);
+    }
+
     private SimulatorProperties properties(int count) {
         return new SimulatorProperties(URI.create("http://event-service.test"), count,
                 Duration.ofMillis(250), Duration.ofSeconds(2), Duration.ofSeconds(15));

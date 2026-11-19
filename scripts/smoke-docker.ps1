@@ -355,6 +355,12 @@ function Invoke-SmokeRun {
     if ([DateTimeOffset]::Parse($incident.createdAt) -lt $started.AddSeconds(-5)) {
         throw 'Incident creation time predates this simulation request.'
     }
+    $serviceHealth = Invoke-SmokeHttp 'GET' ('/api/services/' + $serviceName + '/health') $HttpTimeoutSeconds
+    if ($serviceHealth.serviceName -cne $serviceName -or
+        @('DEGRADED','DOWN') -cnotcontains $serviceHealth.status -or
+        $serviceHealth.activeIncidentCount -lt 1 -or $serviceHealth.errorsLastMinute -lt $ExpectedEventCount) {
+        throw 'Service health does not reflect the isolated failure run and active incident.'
+    }
     # Observe short-lived Redis evidence BEFORE the Kafka scan (correlation window defaults to 60s).
     $redisDeadline = [DateTimeOffset]::UtcNow.AddSeconds([Math]::Min($WaitSeconds,20))
     $redisIds = @()
@@ -393,6 +399,7 @@ function Invoke-SmokeRun {
         kafkaMatchedCount=$eventIds.Count;redisMatchedCount=$redisIds.Count
         eventIds=$eventIds;lastPersistedEventId=$lastEvent.eventId;kafkaConsumerGroup=$group
         incidentStatus=$incident.status;incidentErrorCount=$incident.errorCount
+        serviceHealth=$serviceHealth
         incidentLinkage='rootService and run creation time; baseline incidents expose no direct event FK or traceId'
         analysis=$analysisStatus;evidenceHandles=$evidenceHandles
         retainedData='Synthetic events and incident retained for audit; no cleanup or remediation performed'

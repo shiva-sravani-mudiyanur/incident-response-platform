@@ -159,6 +159,9 @@ Describe 'Docker smoke orchestration (offline adapters)' {
                 return ,$items
             }
             if ($Path -like '/api/incidents/*') { return $global:smokeIncident }
+            if ($Path -like '/api/services/*/health') {
+                return [pscustomobject]@{serviceName='order-service';status='DOWN';errorsLastMinute=1;activeIncidentCount=1}
+            }
             if ($Path -like '/api/services/*') {
                 if ($null -eq $global:smokeEvent) { return [pscustomobject]@{serviceName='order-service';events=@();page=0;totalElements=0;totalPages=0} }
                 return [pscustomobject]@{serviceName='order-service';events=@($global:smokeEvent);page=0;totalElements=1;totalPages=1}
@@ -175,6 +178,10 @@ Describe 'Docker smoke orchestration (offline adapters)' {
             }
             throw 'Unexpected HTTP adapter call'
         }
+        # Pester 3 retains parameter-filtered mocks across a Describe block.
+        Mock Invoke-SmokeHttp {
+            [pscustomobject]@{serviceName='order-service';status='DOWN';errorsLastMinute=1;activeIncidentCount=1}
+        } -ParameterFilter { $Path -eq '/api/services/order-service/health' }
         Mock Invoke-SmokeCompose {
             param($Command,$TimeoutSeconds,$KafkaRead)
             $global:smokeComposeArguments = $ComposeArguments
@@ -215,6 +222,8 @@ Describe 'Docker smoke orchestration (offline adapters)' {
         $summary.redisMatchedCount | Should Be 1
         $summary.analysis | Should Be 'not requested (-IncludeAi required)'
         $summary.serviceName | Should Be 'order-service'
+        $summary.serviceHealth.status | Should Be 'DOWN'
+        $summary.serviceHealth.errorsLastMinute | Should Be 1
         Assert-MockCalled -Scope It Invoke-SmokeHttp -Times 1 -Exactly -ParameterFilter { $Method -eq 'POST' -and $Path -eq '/simulate/database-failure' }
         Assert-MockCalled -Scope It Invoke-SmokeHttp -Times 0 -Exactly -ParameterFilter { $Path -like '/api/analysis/*' }
         Assert-MockCalled -Scope It Invoke-SmokeCompose -Times 1 -Exactly -ParameterFilter {
@@ -222,6 +231,14 @@ Describe 'Docker smoke orchestration (offline adapters)' {
             $Command -contains '--from-beginning' -and $Command -contains '--max-messages' -and
             $Command -contains '--timeout-ms' -and ($Command -join ' ') -match '--group smoke-[0-9a-f]{32}'
         }
+    }
+    It 'rejects a healthy domain response before any opted-in analysis' {
+        $IncludeAi = $true
+        Mock Invoke-SmokeHttp {
+            [pscustomobject]@{serviceName='order-service';status='HEALTHY';errorsLastMinute=1;activeIncidentCount=1}
+        } -ParameterFilter { $Path -eq '/api/services/order-service/health' }
+        { Invoke-SmokeRun } | Should Throw
+        Assert-MockCalled -Scope It Invoke-SmokeHttp -Times 0 -Exactly -ParameterFilter { $Path -like '/api/analysis/*' }
     }
     It 'passes multiple explicit env files to Compose in order without reading contents' {
         $EnvFile = @('.env','.env.stage13')

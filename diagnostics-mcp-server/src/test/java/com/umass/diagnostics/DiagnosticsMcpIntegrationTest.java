@@ -142,7 +142,7 @@ class DiagnosticsMcpIntegrationTest {
             "get_recent_errors,serviceName", "get_related_events,incidentId"})
     void invokesAllToolsOverActualStreamableHttp(String name, String parameter) {
         String value = parameter.equals("incidentId") ? incidentId.toString() : "order-service";
-        var result = client.callTool(new McpSchema.CallToolRequest(name, Map.of(parameter, value)));
+        var result = client.callTool(McpSchema.CallToolRequest.builder(name).arguments(Map.of(parameter, value)).build());
         assertThat(result.isError()).isFalse();
         Map<String, Object> envelope = object(result.structuredContent());
         assertThat(envelope).containsEntry("success", true);
@@ -168,7 +168,7 @@ class DiagnosticsMcpIntegrationTest {
             "get_service_health,serviceName,..", "get_recent_errors,serviceName,../other",
             "get_error_frequency,serviceName,../other"})
     void invalidInputsReturnStructuredToolErrorsWithoutUpstreamCalls(String tool, String parameter, String input) {
-        var result = client.callTool(new McpSchema.CallToolRequest(tool, Map.of(parameter, input)));
+        var result = client.callTool(McpSchema.CallToolRequest.builder(tool).arguments(Map.of(parameter, input)).build());
         assertThat(result.isError()).isTrue();
         Map<String, Object> envelope = object(result.structuredContent());
         assertThat(envelope).containsEntry("success", false);
@@ -178,8 +178,8 @@ class DiagnosticsMcpIntegrationTest {
 
     @Test
     void unavailableDownstreamIsAnMcpToolErrorNotEmptySuccess() {
-        var result = client.callTool(new McpSchema.CallToolRequest("get_service_health",
-                Map.of("serviceName", "unavailable-service")));
+        var result = client.callTool(McpSchema.CallToolRequest.builder("get_service_health")
+                .arguments(Map.of("serviceName", "unavailable-service")).build());
         assertThat(result.isError()).isTrue();
         Map<String, Object> envelope = object(result.structuredContent());
         assertThat(envelope).containsEntry("success", false);
@@ -189,8 +189,8 @@ class DiagnosticsMcpIntegrationTest {
 
     @Test
     void unknownServiceIsARecognizableNotFoundToolError() {
-        var result = client.callTool(new McpSchema.CallToolRequest("get_service_health",
-                Map.of("serviceName", "missing-service")));
+        var result = client.callTool(McpSchema.CallToolRequest.builder("get_service_health")
+                .arguments(Map.of("serviceName", "missing-service")).build());
         assertThat(result.isError()).isTrue();
         assertThat(object(object(result.structuredContent()).get("error"))).containsEntry("code", "NOT_FOUND");
     }
@@ -199,7 +199,7 @@ class DiagnosticsMcpIntegrationTest {
     @org.junit.jupiter.params.provider.ValueSource(strings = {"get_incident", "get_recent_errors", "get_service_health",
             "get_error_frequency", "get_related_events"})
     void missingArgumentIsRejectedWithoutAnUpstreamRequest(String tool) {
-        var result = client.callTool(new McpSchema.CallToolRequest(tool, Map.of()));
+        var result = client.callTool(McpSchema.CallToolRequest.builder(tool).arguments(Map.of()).build());
         assertThat(result.isError()).isTrue();
         assertThat(requests).isEmpty();
     }
@@ -221,11 +221,13 @@ class DiagnosticsMcpIntegrationTest {
                                 "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}"))
                         .build(), HttpResponse.BodyHandlers.ofString());
                 assertThat(notification.statusCode()).isEqualTo(202);
+                assertThat(notification.body()).isEmpty();
                 var list = http.send(rawRequest(origin).header("Mcp-Session-Id", session)
                         .header("MCP-Protocol-Version", protocol).POST(HttpRequest.BodyPublishers.ofString(
                                 "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\",\"params\":{}}"))
                         .build(), HttpResponse.BodyHandlers.ofString());
                 assertThat(list.statusCode()).isEqualTo(200);
+                assertThat(list.headers().firstValue("Content-Type").orElseThrow()).startsWith("text/event-stream");
                 assertThat((List<?>) object(rpcBody(list).get("result")).get("tools")).hasSize(5);
                 var call = http.send(rawRequest(origin).header("Mcp-Session-Id", session)
                         .header("MCP-Protocol-Version", protocol).POST(HttpRequest.BodyPublishers.ofString("""
@@ -241,6 +243,47 @@ class DiagnosticsMcpIntegrationTest {
                         .header("MCP-Protocol-Version", protocol).DELETE().build(), HttpResponse.BodyHandlers.ofString());
                 assertThat(termination.statusCode()).isEqualTo(200);
             }
+        }
+    }
+
+    @Test
+    void missingSessionReturnsSanitizedTransportErrorWithoutUpstreamCalls() throws Exception {
+        String origin = "http://127.0.0.1:" + application.getEnvironment().getRequiredProperty("local.server.port");
+        try (var http = HttpClient.newHttpClient()) {
+            var response = http.send(rawRequest(origin).POST(HttpRequest.BodyPublishers.ofString(
+                    "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}"))
+                    .build(), HttpResponse.BodyHandlers.ofString());
+            assertThat(response.statusCode()).isEqualTo(400);
+            assertThat(response.body()).doesNotContain("stackTrace", "cause", "suppressed", "localizedMessage");
+            assertThat(rpcBody(response)).containsOnlyKeys("jsonRpcError");
+            assertThat(object(rpcBody(response).get("jsonRpcError"))).containsEntry("code", -32601)
+                    .containsEntry("message", "Session ID missing");
+            assertThat(requests).isEmpty();
+        }
+    }
+
+    @ParameterizedTest
+    @CsvSource({"malformed,400,-32600,Invalid message format",
+            "accept,400,-32601,Invalid Accept headers. Expected TEXT_EVENT_STREAM and APPLICATION_JSON",
+            "unknown-session,404,-32603,MCP session unavailable or internal server error"})
+    void invalidTransportRequestsPreserveStatusWithoutLeakingThrowableOrInput(
+            String branch, int status, int code, String message) throws Exception {
+        String origin = "http://127.0.0.1:" + application.getEnvironment().getRequiredProperty("local.server.port");
+        String privateInput = "private-untrusted-input";
+        var request = rawRequest(origin);
+        String body = "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}";
+        if (branch.equals("malformed")) body = "{\"" + privateInput + "\":";
+        if (branch.equals("accept")) request.setHeader("Accept", "application/json");
+        if (branch.equals("unknown-session")) request.header("Mcp-Session-Id", privateInput);
+        try (var http = HttpClient.newHttpClient()) {
+            var response = http.send(request.POST(HttpRequest.BodyPublishers.ofString(body)).build(),
+                    HttpResponse.BodyHandlers.ofString());
+            assertThat(response.statusCode()).isEqualTo(status);
+            assertThat(response.body()).doesNotContain("stackTrace", "cause", "suppressed", "localizedMessage", privateInput);
+            assertThat(rpcBody(response)).containsOnlyKeys("jsonRpcError");
+            assertThat(object(rpcBody(response).get("jsonRpcError"))).containsOnlyKeys("code", "message")
+                    .containsEntry("code", code).containsEntry("message", message);
+            assertThat(requests).isEmpty();
         }
     }
 

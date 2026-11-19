@@ -102,7 +102,28 @@ class DiagnosticsServiceTest {
         var result = service.getRecentErrors("orders").data();
         assertEquals(java.util.List.of(error),result.events());
         assertEquals(5,result.scannedEvents());
-        assertFalse(result.truncated());
+        assertTrue(result.truncated());
+    }
+    @ParameterizedTest
+    @org.junit.jupiter.params.provider.CsvSource({"ERROR,0", "INFO,0", "ERROR,-61"})
+    void repeatedScannedIdsMarkStableTotalHistoryIncompleteRegardlessOfSelection(String severity, long ageSeconds) {
+        var a = event(1,"ERROR",NOW);
+        var b = event(2,severity,NOW.plusSeconds(ageSeconds));
+        var c = event(3,"CRITICAL",NOW);
+        // Both pages claim four rows, but [A,B],[B,C] is not a complete unique traversal.
+        when(client.getServiceEvents("orders",0,2)).thenReturn(page(0,4,a,b));
+        when(client.getServiceEvents("orders",1,2)).thenReturn(page(1,4,b,c));
+        var result = service.getRecentErrors("orders").data();
+        assertEquals(severity.equals("ERROR") && ageSeconds == 0
+                ? java.util.List.of(a,b,c) : java.util.List.of(a,c), result.events());
+        assertEquals(4,result.scannedEvents());
+        assertEquals(2,result.scannedPages());
+        assertFalse(result.hasMore());
+        assertTrue(result.truncated());
+        var order = inOrder(client);
+        order.verify(client).getServiceEvents("orders",0,2);
+        order.verify(client).getServiceEvents("orders",1,2);
+        verifyNoMoreInteractions(client);
     }
     @Test void pageCapReportsIncompleteCoverageEvenIfNoMatchesWereFound() {
         when(client.getServiceEvents("orders",0,2)).thenReturn(page(0,6,event(1,"INFO",NOW),event(2,"INFO",NOW)));

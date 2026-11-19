@@ -24,11 +24,15 @@ public record SimulatorProperties(@NotNull URI eventServiceBaseUrl,
         if (cascadeDelay != null && cascadeDelay.isNegative()) {
             throw new IllegalArgumentException("simulator.cascade-delay must not be negative");
         }
-        if (connectTimeout != null && (connectTimeout.isNegative() || connectTimeout.isZero())) {
-            throw new IllegalArgumentException("simulator.connect-timeout must be positive");
+        // SimpleClientHttpRequestFactory truncates Duration to an int millisecond timeout;
+        // zero means unbounded, and larger values cannot be represented safely.
+        if (connectTimeout != null && (connectTimeout.compareTo(Duration.ofMillis(1)) < 0
+                || connectTimeout.compareTo(Duration.ofMillis(Integer.MAX_VALUE)) > 0)) {
+            throw new IllegalArgumentException("simulator.connect-timeout must be between 1ms and 2147483647ms");
         }
-        if (readTimeout != null && (readTimeout.isNegative() || readTimeout.isZero())) {
-            throw new IllegalArgumentException("simulator.read-timeout must be positive");
+        if (readTimeout != null && (readTimeout.compareTo(Duration.ofMillis(1)) < 0
+                || readTimeout.compareTo(Duration.ofMillis(Integer.MAX_VALUE)) > 0)) {
+            throw new IllegalArgumentException("simulator.read-timeout must be between 1ms and 2147483647ms");
         }
     }
 }

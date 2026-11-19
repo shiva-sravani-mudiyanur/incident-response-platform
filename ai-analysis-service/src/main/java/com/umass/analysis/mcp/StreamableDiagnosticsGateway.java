@@ -81,7 +81,7 @@ public class StreamableDiagnosticsGateway implements DiagnosticsGateway {
             if (rootService == null && !toolName.equals("get_incident")) throw policyViolation();
             if (++calls > properties.maxToolCalls()) throw policyViolation();
             try {
-                var request = new McpSchema.CallToolRequest(toolName, Map.copyOf(arguments));
+                var request = McpSchema.CallToolRequest.builder(toolName).arguments(Map.copyOf(arguments)).build();
                 var response = resilience.read(() -> client.callTool(request));
                 Map<String, Object> envelope = object(response.structuredContent());
                 if (!Boolean.FALSE.equals(response.isError()) || !Boolean.TRUE.equals(envelope.get("success"))) {

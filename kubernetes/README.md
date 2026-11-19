@@ -19,7 +19,8 @@ All inter-application destinations use Kubernetes Service DNS (`incident-service
 Use Docker Desktop Kubernetes, Kind, or Minikube. Ensure `kubectl` is installed and a node is Ready before applying workloads. Do not apply these resources to an unknown or production context.
 
 ```powershell
-Set-Location 'C:\Users\Shiva Sravani\Desktop\incident-response'
+# Replace this path with your actual checkout directory.
+Set-Location 'C:\path\to\incident-response'
 kubectl config current-context
 kubectl get nodes
 ```
@@ -94,10 +95,11 @@ kubectl -n incident-response create secret generic incident-database --from-env-
 
 Required file keys are `DB_USERNAME` and `DB_PASSWORD`; the database name is nonsecret configuration. The local file is already excluded by the repository's `.env.*` ignore rule. PostgreSQL and incident-service reference this Secret; the other applications do not receive its credentials.
 
-Use a provider-only ignored local env file containing `OPENAI_API_KEY`, `OPENAI_MODEL`, and optionally `SPRING_AI_OPENAI_CHAT_BASE_URL`. The current local `.env` can be used if it contains your provider settings; never paste the key into commands or chat. For OpenRouter the base URL is `https://openrouter.ai/api/v1`; otherwise use the selected provider's compatible endpoint. The default nonsecret configuration targets `https://api.openai.com/v1`.
+Create a separate provider-only ignored local file `.env.kubernetes-provider` containing only `OPENAI_API_KEY`, `OPENAI_MODEL`, and optionally `SPRING_AI_OPENAI_CHAT_BASE_URL`. Do not import the complete root `.env`: it can also contain unrelated database and Grafana credentials. Never paste the key into commands or chat. For OpenRouter the base URL is `https://openrouter.ai/api/v1`; otherwise use the selected provider's compatible endpoint. The default nonsecret configuration targets `https://api.openai.com/v1`.
 
 ```powershell
-kubectl -n incident-response create secret generic analysis-provider --from-env-file=.env
+notepad.exe .env.kubernetes-provider
+kubectl -n incident-response create secret generic analysis-provider --from-env-file=.env.kubernetes-provider
 kubectl -n incident-response get secrets
 ```
 

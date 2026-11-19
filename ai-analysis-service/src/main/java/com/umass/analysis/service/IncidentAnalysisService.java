@@ -129,7 +129,7 @@ public class IncidentAnalysisService {
         var snapshot = new ArrayList<>(messages);
         snapshot.set(0, new SystemMessage(INSTRUCTIONS + "\nServer-reported limitations: "
                 + mapper.writeValueAsString(capture.limitations) + "\n" + converter.getFormat()));
-        var defaults = model.getDefaultOptions();
+        var defaults = model.getOptions();
         var options = defaults instanceof ToolCallingChatOptions providerOptions
                 ? providerOptions.mutate().toolCallbacks(TOOLS).build()
                 : ToolCallingChatOptions.builder().toolCallbacks(TOOLS).build();

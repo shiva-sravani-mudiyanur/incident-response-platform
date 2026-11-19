@@ -71,6 +71,7 @@ public class DiagnosticsService {
     private Scan scan(String name, Predicate<ServiceEvent> select) {
         var selected = new ArrayList<ServiceEvent>();
         var ids = new HashSet<UUID>();
+        var scannedIds = new HashSet<UUID>();
         int scannedEvents = 0;
         int scannedPages = 0;
         boolean hasMore = true;
@@ -83,7 +84,10 @@ public class DiagnosticsService {
             scannedPages++;
             scannedEvents += history.events().size();
             for (var event : history.events()) {
-                if (select.test(event) && ids.add(UUID.fromString(event.eventId()))) selected.add(event);
+                var id = UUID.fromString(event.eventId());
+                // Even filtered-out repeats prove the traversal is not a complete unique enumeration.
+                if (!scannedIds.add(id)) changed = true;
+                if (select.test(event) && ids.add(id)) selected.add(event);
             }
             // History is sorted by SOURCE timestamp, never stop on old processedAt values.
             hasMore = page + 1 < history.totalPages();

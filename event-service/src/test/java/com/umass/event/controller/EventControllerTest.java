@@ -98,6 +98,18 @@ class EventControllerTest {
         verifyNoInteractions(service);
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {"serviceName", "message", "traceId"})
+    void embeddedNulReturns400BeforePublication(String field) throws Exception {
+        org.mockito.Mockito.lenient().when(service.accept(any(ServiceEvent.class))).thenReturn(event(UUID.randomUUID()));
+
+        mvc.perform(post("/api/events").contentType(APPLICATION_JSON)
+                        .content(invalidValue(field, "before\0after")))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.errors." + field).exists());
+        verifyNoInteractions(service);
+    }
+
     private static Stream<String> invalidPayloads() {
         var nullMetadataValue = new HashMap<String, String>();
         nullMetadataValue.put("key", null);

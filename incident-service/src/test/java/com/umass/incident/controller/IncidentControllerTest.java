@@ -116,6 +116,21 @@ class IncidentControllerTest {
     }
 
     @ParameterizedTest
+    @ValueSource(strings = {"title", "rootService"})
+    void nulInPersistedIncidentFieldsReturns400BeforeService(String field) throws Exception {
+        org.mockito.Mockito.lenient().when(service.createIncident(any(CreateIncidentRequest.class)))
+                .thenReturn(response(UUID.randomUUID()));
+        String title = field.equals("title") ? "Failure\\u0000" : "Failure";
+        String rootService = field.equals("rootService") ? "payment\\u0000" : "payment";
+        mvc.perform(post("/api/incidents").contentType(APPLICATION_JSON).content("""
+                {"title":"%s","severity":"HIGH","rootService":"%s","errorCount":1}
+                """.formatted(title, rootService)))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.errors." + field).value("must not contain NUL"));
+        verifyNoInteractions(service);
+    }
+
+    @ParameterizedTest
     @ValueSource(strings = {"{}", "null", "{", "{\"title\":\"Failure\",\"severity\":\"URGENT\",\"rootService\":\"payment\",\"errorCount\":1}"})
     void malformedOrMissingFieldsReturn400(String body) throws Exception {
         mvc.perform(post("/api/incidents").contentType(APPLICATION_JSON).content(body))

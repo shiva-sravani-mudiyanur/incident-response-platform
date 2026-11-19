@@ -1,6 +1,8 @@
 # incident-response-platform
 
-A portfolio-focused distributed incident response platform. The intended system will ingest operational events, correlate failures deterministically, persist incidents, and eventually provide evidence-grounded AI investigations. Only the completed stages described below are implemented.
+A portfolio-focused distributed incident response platform. It ingests operational events, correlates failures deterministically, persists incidents, and supports read-only, evidence-grounded AI investigations. Only the completed stages described below are implemented.
+
+In reusable Windows commands, replace `C:\path\to\incident-response` with your actual checkout directory before running them. Keep each native application in its own terminal; use a separate free terminal for verification.
 
 ## Current services
 
@@ -14,6 +16,19 @@ A portfolio-focused distributed incident response platform. The intended system 
 | api-gateway | 8081 | Config-driven HTTP entry point for event, incident, service, analysis, and simulation APIs | Selected downstream services over HTTP only |
 
 All six modules use Java 21 and Spring Boot 4.0.9, inherited from the root Maven POM. Each runs as its own application: native mode uses separate terminals, while Stage 13 Compose mode runs them as separate containers. SERVER_PORT can override its default port. Stage 4 connects event-service and incident-service through Kafka and persists incident_events asynchronously. Stage 5 adds Redis-backed failure correlation and deterministic automatic incident creation without an LLM. Stage 7 adds an HTTP-only scenario generator; it does not implement detection or access Kafka, Redis, PostgreSQL, or the incident API directly. Stage 8 adds operational health/history APIs; Stage 9 exposes five read-only MCP tools backed only by those REST APIs and the existing incident API. Stage 10 adds a separate OpenAI-backed analysis service that reads diagnostics through MCP only; detection remains deterministic. Stage 11 adds an optional API gateway on loopback port 8081 as one convenient client entry point; existing services and their internal communication remain independent. Stage 12 adds bounded resilience only to diagnostics REST GETs and scoped AI MCP diagnostic reads, without gateway or model retries.
+
+## Stage 17: full end-to-end verification
+
+The complete repository was reviewed and the final native Windows Maven `clean verify` passed **612 Java tests**, with zero failures/errors/skips and no Maven compiler warnings. The separate packaging/configuration and PowerShell contracts passed **21** and **28** checks respectively. Normal model tests remain offline; a real provider analysis was verified separately through the deployed gateway.
+
+```powershell
+$env:JAVA_HOME = 'C:\Program Files\Java\jdk-21'
+.\mvnw.cmd -B -ntp '-Dmaven.compiler.showDeprecation=true' clean verify
+```
+
+An isolated full Compose deployment proved the five-event simulator → event-service → Kafka → incident-service → Redis → PostgreSQL path, a new OPEN incident, DOWN service health and an AI response containing actual MCP evidence, probable cause and recommendations. Live duplicate replay preserved the stored event/incident; temporary consumer unavailability returned bounded errors, kept event publication available and drained the queued event after restoration without reposting.
+
+Changes are limited to correctness/cleanup regressions, safe invalid-input/error handling, timeout/history-completeness fixes and corrected documentation. No new architecture or dependency/framework upgrade was introduced. See [the complete Stage 17 report](docs/stage17-verification.md) for per-module totals, all requested checks, actual IDs/statuses, files changed, remaining production-hardening limits and safe manual readback. The verification stack/data are retained; repeating a creation smoke requires a fresh isolated project, and another analysis may incur charges.
 
 ## Stage 16: minimal observability
 
@@ -37,7 +52,7 @@ Default local URLs (host ports are configurable):
 From a free Windows PowerShell terminal at the project root:
 
 ```powershell
-Set-Location 'C:\Users\Shiva Sravani\Desktop\incident-response'
+Set-Location 'C:\path\to\incident-response'
 # Keep your existing .env. Add GRAFANA_ADMIN_PASSWORD locally; never share it.
 # A complete stack also needs the existing DB_* and OPENAI_API_KEY/OPENAI_MODEL settings.
 notepad.exe .env
@@ -75,7 +90,7 @@ Incident-service exposes read-only `GET /api/instance`, returning `serviceName`,
 Run the bounded, read-only demo through Service DNS, from the gateway pod as an HTTP client:
 
 ```powershell
-Set-Location 'C:\Users\Shiva Sravani\Desktop\incident-response'
+Set-Location 'C:\path\to\incident-response'
 $env:KUBECONFIG = Join-Path $env:USERPROFILE '.kube\incident-response-stage14.yaml'
 kubectl -n incident-response rollout status deployment/incident-service --timeout=300s
 powershell.exe -NoProfile -File .\kubernetes\demo-load-balancing.ps1 -Requests 20
@@ -185,7 +200,7 @@ HTTP -> IncidentController -> IncidentService -> IncidentRepository -> PostgreSQ
 
 JPA entities are never returned from controllers. Creation assigns a UUID, OPEN status, and UTC creation/update timestamps on the server. The caller supplies title, severity, rootService, and errorCount. Timestamp precision is normalized to PostgreSQL microseconds so a creation response matches subsequent retrieval. Status updates preserve identity, creation time, and other incident fields. All three defined statuses are accepted; no transition restrictions are introduced in this stage.
 
-Stage 2 added PostgreSQL persistence; Stage 4 added KRaft Kafka and a topic initializer to Compose; Stage 5 adds transient Redis correlation state. All six Java applications run natively on Windows, not in containers; Compose still runs infrastructure only. Stage 8 exposes operational REST APIs and restricted Actuator health/info/metrics in incident-service. Stage 9 adds a REST-backed MCP server; Stage 10 adds read-only AI analysis. Stage 11 adds an HTTP-only API gateway; Kubernetes remains unimplemented.
+Stage 2 added PostgreSQL persistence; Stage 4 added KRaft Kafka and a topic initializer to Compose; Stage 5 adds transient Redis correlation state. Native Windows startup remains supported; Stage 13 also packages all six applications in Compose, and Stages 14–15 provide the local Kubernetes deployment and HTTP-balancing demo. Stage 8 exposes operational REST APIs; Stage 9 adds a REST-backed MCP server; Stage 10 adds read-only AI analysis; Stage 11 adds an HTTP-only API gateway. Stage 16 exposes the four restricted read-only Actuator endpoints on all six applications and adds Compose monitoring.
 
 ## Prerequisites
 
@@ -307,7 +322,9 @@ Flyway applies `V1__create_incidents_table.sql` and the new `V2__create_incident
 For Compose configuration saved between sessions, copy the example locally:
 
 ```powershell
-Copy-Item .env.example .env
+if (-not (Test-Path -LiteralPath '.env')) {
+    Copy-Item -LiteralPath '.env.example' -Destination '.env'
+}
 notepad .env
 ```
 
@@ -463,7 +480,7 @@ POST /api/events requires Content-Type: application/json. The ServiceEvent DTO c
 
 The initial EventType values are SERVICE_STARTED, SERVICE_STOPPED, REQUEST_FAILED, DATABASE_ERROR, DEPENDENCY_ERROR, TIMEOUT. This small initial contract was chosen because the Stage 3 request did not specify event-type values. Enum names are case-sensitive; unknown names and numeric enum ordinals are rejected.
 
-The response is an EventAcceptedResponse containing only eventId. Logging includes eventId, serviceName, eventType, severity, and timestamp. Raw message, traceId, and metadata are not logged or echoed in the acknowledgement; line breaks in the logged service name are sanitized. The accepted service object retains its payload and a defensive, immutable metadata snapshot.
+The response is an EventAcceptedResponse containing only eventId. Receipt/publication JSON logs include eventId and serviceName, with the original traceId in scoped MDC since Stage 16. Raw message and metadata are neither logged nor echoed in the acknowledgement; line breaks in the logged service name are sanitized. The accepted service object retains its payload and a defensive, immutable metadata snapshot.
 
 ### Verify event acceptance
 
@@ -523,7 +540,7 @@ Serialization is configured in KafkaProducerConfiguration/KafkaConsumerConfigura
 
 The incident_events table stores event_id (primary key), service_name, event_type, severity, message, timestamp, nullable trace_id, and processed_at. Source and processing instants use PostgreSQL microsecond precision. Metadata travels in Kafka JSON but is not persisted in this initial table. Stage 4 supplied durable event storage; Stage 5 adds automatic incidents using the correlation rules below.
 
-Consumer auto-commit is disabled. RECORD acknowledgement commits after the transactional processing method returns successfully. Database or Redis failures propagate and retry indefinitely with a configurable interval; they are not intentionally skipped. Invalid DTOs and malformed JSON are logged with topic/partition/offset and skipped so a poison record does not block following valid events. There is no dead-letter topic in this stage. Logs omit raw payload/message/trace/metadata. The processor skips an eventId already committed to incident_events, preserving the stored row and preventing repeated correlation, even after Redis expiry. Stage 6 makes this database decision atomic for concurrent deliveries as well. Redis also deduplicates retried, not-yet-committed events within its window. This is at-least-once processing, not an exactly-once claim or a transactional outbox.
+Consumer auto-commit is disabled. RECORD acknowledgement commits after the transactional processing method returns successfully. Database or Redis failures propagate and retry indefinitely with a configurable interval; they are not intentionally skipped. Invalid DTOs and malformed JSON are logged with topic/partition/offset and skipped so a poison record does not block following valid events. There is no dead-letter topic in this stage. Logs omit raw payload/message/metadata; since Stage 16, related event logs retain traceId in scoped MDC for correlation. The processor skips an eventId already committed to incident_events, preserving the stored row and preventing repeated correlation, even after Redis expiry. Stage 6 makes this database decision atomic for concurrent deliveries as well. Redis also deduplicates retried, not-yet-committed events within its window. This is at-least-once processing, not an exactly-once claim or a transactional outbox.
 
 After starting infrastructure and both services, post the event shown above and save the returned eventId. Then:
 
@@ -599,7 +616,7 @@ These are **sorted-set** keys: use ZCARD, not GET. PTTL is remaining lifetime in
 
 The idempotency key is ServiceEvent.eventId. PostgreSQL already enforces uniqueness through the event_id primary key in V2; no applied migration is changed and no new migration is required.
 
-EventProcessingService validates the event, then performs `INSERT ... ON CONFLICT (event_id) DO NOTHING` through IncidentEventRepository inside the processing transaction. Only an inserted row proceeds to Redis correlation. A duplicate returns normally, logs `Ignoring duplicate event`, and does not change the original event row, Redis counters, or incidents. This replaces the earlier check-then-save race: concurrent deliveries wait for PostgreSQL's uniqueness decision instead of raising avoidable duplicate-key failures. Reusing an ID with different valid payload data still preserves the first committed row; send a new ID for a genuinely new event.
+EventProcessingService validates the event, then performs `INSERT ... ON CONFLICT (event_id) DO NOTHING` through IncidentEventRepository inside the processing transaction. Only an inserted row proceeds to Redis correlation. A duplicate returns normally, logs `Duplicate event ignored`, and does not change the original event row, Redis counters, or incidents. This replaces the earlier check-then-save race: concurrent deliveries wait for PostgreSQL's uniqueness decision instead of raising avoidable duplicate-key failures. Reusing an ID with different valid payload data still preserves the first committed row; send a new ID for a genuinely new event.
 
 Event persistence and automatic incident creation commit together in PostgreSQL. If processing fails, the insert rolls back and Kafka can retry. Redis's atomic UUID-member deduplication protects retries within the correlation window; the PostgreSQL gate remains effective after Redis expiry or application restart, as long as the stored event row is retained. Redis and PostgreSQL still do not share a distributed atomic transaction; this is not a general exactly-once guarantee across failures, cache loss, or deliberate database deletion.
 
@@ -629,7 +646,7 @@ POST /simulate/{scenario} -> service-simulator -> HTTP POST /api/events
 Start infrastructure and the first two applications using the earlier sections. In a **third Windows PowerShell terminal**, change to the project root and set the simulator's environment explicitly (variables do not carry over from other terminals):
 
 ```powershell
-Set-Location 'C:\Users\Shiva Sravani\Desktop\incident-response'
+Set-Location 'C:\path\to\incident-response'
 $env:EVENT_SERVICE_BASE_URL = 'http://localhost:8082'
 $env:SERVER_PORT = '8083'
 .\mvnw.cmd -pl service-simulator spring-boot:run
@@ -808,7 +825,7 @@ MCP client -> POST /mcp -> @McpTool adapter -> DiagnosticsService
 Keep incident-service running with its existing dependencies for live tool results. The diagnostics process needs only the incident-service origin, not its DB/Kafka/Redis credentials:
 
 ```powershell
-cd 'C:\Users\Shiva Sravani\Desktop\incident-response'
+Set-Location 'C:\path\to\incident-response'
 $env:INCIDENT_SERVICE_BASE_URL = 'http://localhost:8080'
 $env:SERVER_ADDRESS = '127.0.0.1'
 $env:SERVER_PORT = '8084'
@@ -823,7 +840,7 @@ MCP endpoint: `http://127.0.0.1:8084/mcp`. Local server health:
 curl.exe -i http://127.0.0.1:8084/actuator/health
 ```
 
-This checks the MCP application's health, not upstream availability or successful tool execution. The server can start while incident-service is unavailable; tool calls then report structured errors. Diagnostics Actuator exposure is limited to read-only health, with component details and JMX exposure disabled.
+This checks the MCP application's health, not upstream availability or successful tool execution. The server can start while incident-service is unavailable; tool calls then report structured errors. Since Stage 16, diagnostics Actuator exposure is limited to read-only health/info/metrics/prometheus, with component details, sensitive endpoints, discovery and JMX exposure disabled.
 
 ### Available tools and REST boundaries
 
@@ -946,7 +963,7 @@ Keep incident-service (8080), diagnostics-mcp-server (8084), and incident-servic
 OpenAI requests send diagnostic operational data, including selected incident/event text, to OpenAI and may incur charges. Choose an account-accessible Chat Completions model that supports function calling. Model selection is explicit rather than silently choosing a model/cost for you.
 
 ```powershell
-cd 'C:\Users\Shiva Sravani\Desktop\incident-response'
+Set-Location 'C:\path\to\incident-response'
 $env:DIAGNOSTICS_MCP_BASE_URL = 'http://127.0.0.1:8084'
 $env:SERVER_ADDRESS = '127.0.0.1'
 $env:SERVER_PORT = '8085'
@@ -963,7 +980,7 @@ Do not paste a real key into source, README, shell commands/history, screenshots
 Remove-Item Env:OPENAI_API_KEY -ErrorAction SilentlyContinue
 ```
 
-Only the AI application's read-only Actuator health endpoint is exposed; sensitive management endpoints and JMX are disabled. Actuator UP does not independently establish MCP availability, OpenAI authorization, billing access, or successful model output.
+Since Stage 16, only the AI application's read-only Actuator health/info/metrics/prometheus endpoints are exposed; sensitive management endpoints, discovery and JMX are disabled. Actuator UP does not independently establish MCP availability, OpenAI authorization, billing access, or successful model output.
 
 ### Request an analysis in Postman
 
@@ -1059,7 +1076,7 @@ The gateway forwards HTTP requests only. It never directly accesses PostgreSQL, 
 Use a separate terminal at the repository root. All four destination variables are required, even if you only plan to exercise one route. Set each explicitly; variables from the other service terminals do not carry over:
 
 ```powershell
-Set-Location 'C:\Users\Shiva Sravani\Desktop\incident-response'
+Set-Location 'C:\path\to\incident-response'
 $env:SERVER_ADDRESS = '127.0.0.1'
 $env:SERVER_PORT = '8081'
 $env:GATEWAY_EVENT_SERVICE_URL = 'http://127.0.0.1:8082'
@@ -1087,7 +1104,7 @@ Routes are configured in `api-gateway/src/main/resources/application.yaml`. Path
 | `/api/analysis/**` | GATEWAY_ANALYSIS_SERVICE_URL | `http://127.0.0.1:8085` |
 | `/simulate/**` | GATEWAY_SIMULATOR_URL | `http://127.0.0.1:8083` |
 
-There is no catch-all proxy, MCP proxy, or downstream Actuator proxy. Only the gateway's own read-only `/actuator/health` is exposed. Gateway administration, metrics, environment/configuration endpoints, and JMX exposure are not enabled. No automatic retry filters, authentication, rate limits, service discovery, or circuit breakers are added.
+There is no catch-all proxy, MCP proxy, or downstream Actuator proxy. Since Stage 16, only the gateway's own read-only `/actuator/health`, `/actuator/info`, `/actuator/metrics` and `/actuator/prometheus` endpoints are exposed. Gateway administration, environment/configuration endpoints, discovery and JMX exposure are not enabled. No automatic retry filters, authentication, rate limits, service discovery, or circuit breakers are added.
 
 ### Safe GET smoke checks in Postman
 
@@ -1097,7 +1114,7 @@ These are instructions for manual verification, **not a claim that the agent ran
 2. With incident-service and its existing infrastructure running, request `http://127.0.0.1:8081/api/incidents`. Expect HTTP 200 and the existing incident array, which may be empty. Optional: GET `http://127.0.0.1:8081/api/incidents?status=OPEN` to check query forwarding without changing data.
 3. GET `http://127.0.0.1:8081/api/services`. Expect HTTP 200 and the existing service inventory array, which may be empty. This is event-derived operational health, not a gateway reachability probe.
 4. If the inventory already contains a service, copy its exact name and GET its `/api/services/{serviceName}/health` and `/api/services/{serviceName}/events?page=0&size=20` through port 8081. Unknown services return the downstream 404; do not generate events just to make this read-only smoke check pass.
-5. GET `http://127.0.0.1:8081/actuator/env`, `/actuator/metrics`, `/actuator/gateway/routes`, and `/mcp` (each on the same gateway origin). These unexposed/unrouted paths should return 404, not downstream administration or MCP data.
+5. GET `http://127.0.0.1:8081/actuator/env`, `/actuator/gateway/routes`, and `/mcp` (each on the same gateway origin). These unexposed/unrouted paths should return 404, not downstream administration or MCP data. GET `/actuator/metrics` separately: expect HTTP 200 with the gateway's own metric inventory, not downstream metrics.
 
 **Do not use POST as a harmless connectivity check.** POST `/api/events` and POST `/simulate/**` can publish real development events and trigger incident creation. POST `/api/analysis/incidents/{incidentId}` can send operational data to the real model provider and incur charges. Forwarding those requests does not make them safer; only use the earlier stage contracts when you intentionally want those effects. There is still no event-retrieval GET endpoint or analysis-list GET endpoint.
 
@@ -1191,7 +1208,7 @@ Optional manual outage observation is for a user-chosen development session only
 
 ## Stage 13: Docker packaging
 
-One command builds and starts all six applications, PostgreSQL, Redis, Kafka, and a one-shot `kafka-init` container:
+One command builds and starts all six applications, PostgreSQL, Redis, Kafka, and a one-shot `kafka-init` container. The current Compose file also starts the Stage 16 Prometheus and Grafana observers:
 
 ```powershell
 docker compose up --build
@@ -1204,14 +1221,14 @@ Use Docker Desktop in Linux-container mode with a current Docker Compose v2 plug
 From Windows PowerShell:
 
 ```powershell
-Set-Location 'C:\Users\Shiva Sravani\Desktop\incident-response'
+Set-Location 'C:\path\to\incident-response'
 if (-not (Test-Path -LiteralPath '.env')) {
     Copy-Item -LiteralPath '.env.example' -Destination '.env'
 }
 notepad.exe .env
 ```
 
-In the local ignored `.env`, set `DB_NAME`, `DB_USERNAME`, `DB_PASSWORD`, `OPENAI_API_KEY`, and `OPENAI_MODEL`. Use your **existing database values** if reusing the existing PostgreSQL volume: editing environment variables does not change credentials in an initialized database. Do not delete a volume or repair Flyway just to fix a connection/configuration issue.
+In the local ignored `.env`, set `DB_NAME`, `DB_USERNAME`, `DB_PASSWORD`, `OPENAI_API_KEY`, and `OPENAI_MODEL`. The current complete stack also requires `GRAFANA_ADMIN_PASSWORD` since Stage 16; `GRAFANA_ADMIN_USER` is optional and defaults to `admin`. Use your **existing database values** if reusing the existing PostgreSQL volume: editing environment variables does not change credentials in an initialized database. Existing Grafana volumes likewise retain their original admin account/password. Do not delete a volume or repair Flyway just to fix a connection/configuration issue.
 
 For an OpenAI-compatible provider such as OpenRouter, also set `SPRING_AI_OPENAI_CHAT_BASE_URL=https://openrouter.ai/api/v1`; the default is `https://api.openai.com/v1`. Use a key and model issued/supported by the selected provider. Keep real keys out of this README, `.env.example`, shell command history, build arguments, and chat. The key/model reach only the AI container at runtime; no real provider call occurs merely from starting the stack. A real analysis sends incident evidence to that provider and can incur charges. The AI container refuses empty key/model settings before starting Java.
 
@@ -1232,6 +1249,8 @@ Before default-port startup, stop only your recognized native application proces
 | `DB_PORT` | required; template 5433 | 5432 |
 | `KAFKA_PORT` | 9092 | 9092 (external listener) |
 | `REDIS_PORT` | 6379 | 6379 |
+| `PROMETHEUS_PORT` | 9090 | 9090 |
+| `GRAFANA_PORT` | 3000 | 3000 |
 
 Every published port binds only to `127.0.0.1`. Applications listen on `0.0.0.0` **inside their own containers** so other containers can reach them. Compose explicitly replaces the native URL examples with Docker DNS addresses, not host loopback:
 
@@ -1264,7 +1283,7 @@ docker compose ps --all
 Invoke-RestMethod 'http://127.0.0.1:8081/actuator/health'
 ```
 
-Expect nine long-running healthy containers and `kafka-init` exited with code 0, not a continuously running initializer. Existing PostgreSQL and Kafka named volumes are preserved. Redis intentionally retains the earlier ephemeral rolling-window policy; correlation counters are not a durable incident database.
+Expect eleven long-running healthy containers (including the Stage 16 observers) and `kafka-init` exited with code 0, not a continuously running initializer. Existing PostgreSQL and Kafka named volumes are preserved. Redis intentionally retains the earlier ephemeral rolling-window policy; correlation counters are not a durable incident database.
 
 ```powershell
 docker compose logs --tail 100 incident-service
@@ -1289,7 +1308,7 @@ powershell.exe -NoProfile -File .\scripts\smoke-docker.ps1 -IncludeAi
 
 Alternatively, omit `-IncludeAi` for pipeline-only verification without a provider call. Choose one mode on a fresh project rather than running both consecutively on the same active `order-service` incident. A pipeline-only run does **not** prove AI analysis passed. The full check reads back simulator acknowledgements, persisted REST history, matching Kafka records through a separate diagnostic consumer, Redis rolling-window members, and the newly created incident; it then validates a real analysis response's captured tool evidence, incident/service/event identities, probable cause, confidence, and recommended actions. It does not claim to semantically verify every sentence of model prose. Incident DTOs do not expose a direct event foreign key; creation is established by clean-run isolation, new ID, service/count/time, and correlated event identities—not an invented `lastEventId` field.
 
-For isolated testing while native applications keep their ports, choose a fresh project and free host ports. The following example assumes the shown alternate ports are free and the earlier database/provider settings are already configured in `.env`:
+For isolated testing while native applications or another Compose stack keep their ports, choose a fresh project and verify that **all** the alternate host ports below are free, including monitoring. Change occupied choices before startup. This example assumes the earlier database/provider/Grafana settings are already configured in `.env`:
 
 ```powershell
 $env:COMPOSE_PROJECT_NAME = 'incident-response-smoke-' + [Guid]::NewGuid().ToString('N')
@@ -1302,6 +1321,8 @@ $env:EVENT_SERVICE_PORT = '28082'
 $env:SIMULATOR_PORT = '28083'
 $env:DIAGNOSTICS_MCP_PORT = '28084'
 $env:AI_ANALYSIS_PORT = '28085'
+$env:PROMETHEUS_PORT = '19090'
+$env:GRAFANA_PORT = '13000'
 docker compose up --build -d --wait --wait-timeout 300
 if ($LASTEXITCODE -ne 0) { throw 'Isolated stack startup failed; do not run smoke.' }
 & .\scripts\smoke-docker.ps1 -Gateway 'http://127.0.0.1:28081' -ProjectName $env:COMPOSE_PROJECT_NAME -IncludeAi

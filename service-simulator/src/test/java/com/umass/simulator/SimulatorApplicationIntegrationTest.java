@@ -140,7 +140,8 @@ class SimulatorApplicationIntegrationTest {
 
     @Test
     void basicHealthEndpointIsAvailable() throws Exception {
-        var request = HttpRequest.newBuilder(URI.create(baseUrl + "/actuator/health")).GET().build();
+        var request = HttpRequest.newBuilder(URI.create(baseUrl + "/actuator/health"))
+                .timeout(Duration.ofSeconds(15)).GET().build();
 
         var response = client.send(request, HttpResponse.BodyHandlers.ofString());
 

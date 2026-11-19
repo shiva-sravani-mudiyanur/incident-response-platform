@@ -138,12 +138,14 @@ class KafkaEventPipelineIntegrationTest {
     }
 
     @ParameterizedTest
-    @ValueSource(strings = {"malformed-json", "missing-severity", "numeric-severity"})
+    @ValueSource(strings = {"malformed-json", "missing-severity", "numeric-severity",
+            "nul-serviceName", "nul-message", "nul-traceId"})
     void invalidRecordIsNotStoredAndDoesNotBlockFollowingValidEvent(String invalidity) throws Exception {
         UUID invalidId = UUID.randomUUID();
         var invalid = payload(invalidId);
         if (invalidity.equals("missing-severity")) invalid.remove("severity");
         if (invalidity.equals("numeric-severity")) invalid.put("severity", 1);
+        if (invalidity.startsWith("nul-")) invalid.put(invalidity.substring(4), "before\0after");
         String json = invalidity.equals("malformed-json") ? "{not-json" : mapper.writeValueAsString(invalid);
         producer.send(new ProducerRecord<>(TOPIC, 0, "payment-service", json)).get(20, TimeUnit.SECONDS);
         UUID validId = UUID.randomUUID();

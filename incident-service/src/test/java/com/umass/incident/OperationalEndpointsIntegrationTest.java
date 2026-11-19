@@ -91,15 +91,19 @@ class OperationalEndpointsIntegrationTest {
     @AfterAll
     void stopInfrastructure() {
         try {
-            if (application != null) application.close();
+            if (client != null) client.close();
         } finally {
             try {
-                if (kafka != null) kafka.stop();
+                if (application != null) application.close();
             } finally {
                 try {
-                    if (redis != null) redis.stop();
+                    if (kafka != null) kafka.stop();
                 } finally {
-                    if (postgres != null) postgres.stop();
+                    try {
+                        if (redis != null) redis.stop();
+                    } finally {
+                        if (postgres != null) postgres.stop();
+                    }
                 }
             }
         }

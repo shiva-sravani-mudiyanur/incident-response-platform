@@ -155,7 +155,10 @@ class EventProcessingServiceTest {
                 new ServiceEvent(event.eventId(), event.serviceName(), null, event.severity(), event.message(), NOW, null, null),
                 new ServiceEvent(event.eventId(), event.serviceName(), event.eventType(), null, event.message(), NOW, null, null),
                 new ServiceEvent(event.eventId(), event.serviceName(), event.eventType(), event.severity(), "", NOW, null, null),
-                new ServiceEvent(event.eventId(), event.serviceName(), event.eventType(), event.severity(), event.message(), null, null, null));
+                new ServiceEvent(event.eventId(), event.serviceName(), event.eventType(), event.severity(), event.message(), null, null, null),
+                new ServiceEvent(event.eventId(), "before\0after", event.eventType(), event.severity(), event.message(), NOW, null, null),
+                new ServiceEvent(event.eventId(), event.serviceName(), event.eventType(), event.severity(), "before\0after", NOW, null, null),
+                new ServiceEvent(event.eventId(), event.serviceName(), event.eventType(), event.severity(), event.message(), NOW, "before\0after", null));
     }
 
     private static ServiceEvent event() {

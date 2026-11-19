@@ -24,7 +24,8 @@ Use one free control terminal. Keep any foreground Java/port-forward terminal ru
 4. Select the intended Compose project and free host ports. The following default command uses `incident-response-platform`. If your full stack is in another project, include that project's explicit arguments instead.
 
 ```powershell
-Set-Location 'C:\Users\Shiva Sravani\Desktop\incident-response'
+# Replace this path with your actual checkout directory.
+Set-Location 'C:\path\to\incident-response'
 notepad.exe .env
 docker compose up -d --build --wait --wait-timeout 300
 docker compose ps
