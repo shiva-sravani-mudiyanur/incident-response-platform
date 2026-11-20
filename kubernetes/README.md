@@ -1,4 +1,4 @@
-# Stage 14: local Kubernetes deployment
+# Kubernetes deployment
 
 Deploy the existing applications; no Java/framework or detection changes are needed. Built-in Kustomize (`kubectl -k`) assembles the manifests. This is a local scaling demonstration, not a production HA/security design.
 
@@ -172,7 +172,7 @@ py -m unittest discover -s tests/packaging -p 'test_kubernetes*.py' -v
 
 The parent verified the actual deployments, every application pod's two probe endpoints, Service DNS, and ready EndpointSlice counts. See [VERIFICATION.md](VERIFICATION.md) for the execution record, replica counts, test results, isolation, and resolved local bootstrap issues. A server-side dry run alone is not evidence that pods became healthy.
 
-## Stage 15: HTTP balancing versus Kafka assignments
+## HTTP balancing versus Kafka assignments
 
 Incident-service now exposes read-only `GET /api/instance` with `serviceName`, OS `hostname`, and current UTC `timestamp`. The hostname naturally matches the Kubernetes pod; no load-balancing algorithm or manual pod-name assignment is in the application. Only incident-service advances to image tag `stage15`; other images remain `stage14`. The Service explicitly keeps `sessionAffinity: None` and two incident replicas.
 

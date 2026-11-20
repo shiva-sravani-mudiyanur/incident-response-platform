@@ -1,8 +1,8 @@
-# Stage 15: HTTP Service distribution and Kafka consumer groups
+# Kubernetes HTTP load-balancing demonstration
 
 These are two different kinds of work distribution, not one load balancer. No custom Java load balancer or sticky-session mechanism is introduced:
 
-| Mechanism | Work being distributed | Stage 15 target |
+| Mechanism | Work being distributed | Demonstration target |
 | --- | --- | --- |
 | Kubernetes `Service` | HTTP connections to the incident API | `incident-service:8080` with at least two Ready incident pods |
 | Kafka consumer group | Ownership of topic partitions | Two consumers in `incident-processors`, consuming the three partitions of `service-events` |

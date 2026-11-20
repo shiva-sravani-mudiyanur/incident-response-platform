@@ -1,5 +1,7 @@
 # Diagnostics read resilience
 
+For the tool architecture and REST boundaries, see [the project README](../README.md#mcp-architecture); for protocol initialization and Postman examples, see [manual MCP requests](../docs/api-examples.md#manual-mcp-requests).
+
 Only `IncidentServiceClient`'s incident, service-health and individual event-page GETs are protected. A tool/history scan is never replayed. There are no write, LLM, Kafka, Redis or database retries.
 
 The module imports Spring Cloud BOM `2025.1.4` (CircuitBreaker `5.0.3`, Resilience4j `2.3.0`); dependency versions remain BOM-managed. Spring Boot, Java, Spring AI and JUnit pins are unchanged.

@@ -41,3 +41,6 @@ build/
 # Python packaging-contract test outputs (not application runtime dependencies).
 __pycache__/
 *.py[cod]
+
+# Local agent continuation notes are not public verification reports.
+/docs/*-resume.md

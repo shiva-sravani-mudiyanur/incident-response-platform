@@ -1,4 +1,4 @@
-# Stage 16 — Minimal observability
+# Observability
 
 ## Architecture and scope
 
