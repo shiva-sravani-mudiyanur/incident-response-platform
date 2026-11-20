@@ -4,8 +4,6 @@ Deterministic incident detection with read-only, evidence-grounded AI diagnostic
 
 A six-service Java platform that accepts operational events, delivers them through Kafka, correlates failures in Redis, and persists incidents in PostgreSQL. A separate AI service investigates existing incidents through narrowly scoped Model Context Protocol (MCP) tools. The LLM does not detect failures, create incidents, change their status, or execute recommendations.
 
-This is a local-development and portfolio project, not an internet-ready incident-management product.
-
 [Architecture](#architecture) · [Docker quick start](#docker-quick-start) · [Five-minute demo](#five-minute-demo-warm-stack) · [API examples](#example-api-requests) · [Kubernetes](#kubernetes-deployment) · [Testing](#testing-strategy) · [Limitations](#known-limitations)
 
 ## Problem being solved
