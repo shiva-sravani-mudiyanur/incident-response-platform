@@ -7,7 +7,7 @@ These are two different kinds of work distribution, not one load balancer. No cu
 | Kubernetes `Service` | HTTP connections to the incident API | `incident-service:8080` with at least two Ready incident pods |
 | Kafka consumer group | Ownership of topic partitions | Two consumers in `incident-processors`, consuming the three partitions of `service-events` |
 
-This is a read-only demonstration guide, not an execution transcript. Deployment, endpoint/tests, the demo script, and actual verification evidence are maintained separately. Do not treat the expected observations below as measured results.
+This is a read-only demonstration guide. Run the commands against your deployment and record the actual responding pod names and Kafka assignments; expected observations below are not measured results for your environment.
 
 ## Repository configuration and prerequisites
 
@@ -20,9 +20,9 @@ The inspected configuration is in:
 - `event-service/src/main/java/com/umass/event/service/KafkaEventPublisher.java`: publishes with `event.serviceName()` as the record key; `config/KafkaProducerConfiguration.java` uses a string key serializer.
 - Root `pom.xml`: Java 21 and Spring Boot `4.0.9`. The existing cluster guide pins Kind `v0.33.0` and Kubernetes node `v1.36.4`; these are repository pins, not a claim about the current live cluster.
 
-Before running this guide, the Stage 15 deployment must be complete: incident-service uses `incident-response/incident-service:stage15` with two replicas, while the other application images retain `stage14`. The endpoint and `kubernetes/demo-load-balancing.ps1` must already be present. This guide does not rebuild images, apply manifests, scale workloads, publish events, or call an AI provider.
+Before running this guide, complete the [Kubernetes deployment](README.md): incident-service uses `incident-response/incident-service:stage15` with two replicas, while the other application image tags are `stage14`. Build/load these local demo tags from the current checkout. This guide does not rebuild images, apply manifests, scale workloads, publish events, or call an AI provider.
 
-The required Service policy is `spec.sessionAffinity: None` (no sticky sessions). The inspected pre-update Service omitted the field, whose Kubernetes default is `None`; Stage 15 makes the intended policy explicit. Check the live Service below instead of assuming the manifest was deployed.[2]
+The Service explicitly sets `spec.sessionAffinity: None` (no sticky sessions). Check the live Service below instead of assuming the manifest was deployed.[2]
 
 ## 1. Select the dedicated cluster in Windows PowerShell
 
@@ -48,7 +48,7 @@ Use current pod names and addresses from this cluster. Do not copy old pod suffi
 
 ## 2. HTTP: send fresh connections through the Service
 
-The Stage 15 read-only endpoint is:
+The read-only instance endpoint is:
 
 ```text
 http://incident-service:8080/api/instance
@@ -131,7 +131,7 @@ Record real results separately after the endpoint, script, and deployment are ve
 - Requested/completed HTTP sample size, actual hostnames and measured counts, and whether at least two unique hostnames were observed.
 - Actual topic partition count, stable group state/member count, and verbose member assignments, mapping hosts only when supported by current Pod IPs.
 
-This document is the procedure and expected interpretation, not an execution transcript. The completed parent-run measurements, test results, image rollout, and native packaging caveat are recorded in [Stage 15 verification](STAGE15_VERIFICATION.md).
+Record results from your own run. A successful sample establishes observed multi-pod HTTP distribution, not equal traffic, throughput capacity or Kafka partition ownership.
 
 ## Sources
 

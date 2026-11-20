@@ -25,7 +25,7 @@ kubectl config current-context
 kubectl get nodes
 ```
 
-For the verified dedicated Kind cluster, each new PowerShell terminal should select its own kubeconfig explicitly:
+For the dedicated Kind cluster used in the example below, each new PowerShell terminal should select its kubeconfig explicitly:
 
 ```powershell
 $env:KUBECONFIG = Join-Path $env:USERPROFILE '.kube\incident-response-stage14.yaml'
@@ -37,7 +37,7 @@ Expected context: `kind-incident-response-stage14`. Keep using this configuratio
 
 ### Creating your own Kind cluster
 
-Install Kind using its official instructions: https://kind.sigs.k8s.io/docs/user/quick-start/ . Verification used Kind v0.33.0 with the following Kubernetes 1.36.4 image (matching the installed kubectl minor version):
+Install Kind using its official instructions: https://kind.sigs.k8s.io/docs/user/quick-start/ . The tested example uses Kind v0.33.0 and the following Kubernetes 1.36.4 image; use a compatible kubectl client:
 
 ```powershell
 $env:KUBECONFIG = Join-Path $env:USERPROFILE '.kube\incident-response-stage14.yaml'
@@ -46,11 +46,11 @@ kind create cluster --name incident-response-stage14 --kubeconfig $env:KUBECONFI
 
 Do not recreate an existing cluster or overwrite a pre-existing kubeconfig just to follow these instructions. If Kind was installed outside PATH, invoke its actual executable path.
 
-The verification host uses cgroup v1. Kubernetes 1.36 refuses this by default; the first bootstrap failed before application deployment. A local-only retry succeeded with the same command plus `--config .\kubernetes\kind-cgroup-v1.yaml`. Prefer a current cgroup-v2 Docker engine. The compatibility patch sets `failCgroupV1: false` only for this development node; it is deprecated and not guaranteed on future Kubernetes releases. It does not alter Docker, restart your host, or change application manifests. See the Kubernetes cgroup guidance: https://kubernetes.io/blog/2026/10/06/kubernetes-cgroups-v2-shift/ .
+Prefer a cgroup-v2 Docker engine. For an older cgroup-v1 host that rejects cluster startup, the optional local compatibility configuration can be selected by adding `--config .\kubernetes\kind-cgroup-v1.yaml` to the creation command. It sets `failCgroupV1: false` for this development node; this compatibility setting is deprecated and not guaranteed on future Kubernetes releases. Do not use it unless your host needs it. See the Kubernetes cgroup guidance: https://kubernetes.io/blog/2026/10/06/kubernetes-cgroups-v2-shift/ .
 
 ## 2. Build and make images available to the nodes
 
-Reuse the Stage 13 Dockerfile; image builds deliberately skip tests, so run regression checks separately.
+Use the shared root Dockerfile; image builds deliberately skip tests, so run regression checks separately.
 
 ```powershell
 $apps = @('api-gateway','event-service','incident-service','diagnostics-mcp-server','ai-analysis-service','service-simulator')
@@ -153,9 +153,9 @@ Invoke-RestMethod 'http://127.0.0.1:18091/actuator/health'
 Invoke-RestMethod 'http://127.0.0.1:18091/api/incidents'
 ```
 
-These are read-only checks and are not AI analysis requests. The Kubernetes database is separate, so UUIDs from the native/Compose stacks need not exist here. An analysis POST may invoke a paid provider; Stage 14 verification stops at healthy deployments and Service discovery, with no simulation, provider call, or remediation.
+These are read-only checks and are not AI analysis requests. The Kubernetes database is separate, so UUIDs from the native/Compose stacks need not exist here. An analysis POST may invoke a paid provider; the GET checks above do not invoke the model or publish events.
 
-## Regression and verification record
+## Regression tests and deployment checks
 
 With Docker Desktop running, the existing native Maven suite remains the regression gate:
 
@@ -164,20 +164,20 @@ $env:JAVA_HOME = 'C:\Program Files\Java\jdk-21'
 .\mvnw.cmd -B -ntp test
 ```
 
-The offline manifest contracts need the kubectl client and Python 3 with PyYAML (the WSL system Python used during verification already supplied it). No cluster, user env-file reads, or provider calls are needed for these contracts:
+The offline manifest contracts need the kubectl client and Python 3 with PyYAML. No cluster, user env-file reads, or provider calls are needed for these contracts:
 
 ```powershell
 py -m unittest discover -s tests/packaging -p 'test_kubernetes*.py' -v
 ```
 
-The parent verified the actual deployments, every application pod's two probe endpoints, Service DNS, and ready EndpointSlice counts. See [VERIFICATION.md](VERIFICATION.md) for the execution record, replica counts, test results, isolation, and resolved local bootstrap issues. A server-side dry run alone is not evidence that pods became healthy.
+To verify a deployment, check the expected Ready replica counts, pod startup/readiness/liveness probes, Service DNS and ready EndpointSlice backends. Use the read-only API requests above to confirm routing. A successful manifest render or server-side dry run alone does not establish that pods are healthy.
 
 ## HTTP balancing versus Kafka assignments
 
-Incident-service now exposes read-only `GET /api/instance` with `serviceName`, OS `hostname`, and current UTC `timestamp`. The hostname naturally matches the Kubernetes pod; no load-balancing algorithm or manual pod-name assignment is in the application. Only incident-service advances to image tag `stage15`; other images remain `stage14`. The Service explicitly keeps `sessionAffinity: None` and two incident replicas.
+Incident-service exposes read-only `GET /api/instance` with `serviceName`, OS `hostname`, and current UTC `timestamp`. The hostname naturally matches the Kubernetes pod; no load-balancing algorithm or manual pod-name assignment is in the application. The manifests use image tag `stage15` for incident-service and `stage14` for the other applications; these are local demo labels, so build/load them from the current checkout. The Service explicitly keeps `sessionAffinity: None` and two incident replicas.
 
 See [the separate load-balancing demo](LOAD_BALANCING.md) for the read-only command, fresh-connection caveat, and the distinct Kafka consumer-group explanation. Do not port-forward incident-service directly to claim Service load balancing: port-forward can pin one pod. The demo uses Service DNS from the gateway pod as a client; it does not add a new gateway route. No events or AI requests are issued.
 
 ## Cleanup boundaries
 
-Leave a verified cluster running for inspection if desired. Stop port-forward with Ctrl+C in its own terminal. Do not delete the namespace/PVCs/Kind cluster as a troubleshooting shortcut; those actions remove this deployment's data. Existing Compose projects/native applications remain independent. Never commit or push automatically.
+Leave the cluster running for inspection if desired. Stop port-forward with Ctrl+C in its own terminal. Do not delete the namespace/PVCs/Kind cluster as a troubleshooting shortcut; those actions remove this deployment's data. Existing Compose projects/native applications remain independent.

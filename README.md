@@ -311,7 +311,7 @@ The script starts a fresh curl process inside the gateway pod for each read of `
 
 Kubernetes Service networking distributes connections; persistent connections can reuse one backend and strict round-robin/equal counts are not guaranteed. A Service port-forward can pin one pod and is not this demonstration. `/api/instance` is not a gateway HTTP route: the gateway pod is only the curl client's location.
 
-Kafka partition assignment is separate from HTTP load balancing. Inspect actual group members/assignments rather than inferring them from HTTP counts. See [the complete demo](kubernetes/LOAD_BALANCING.md) and [dated execution evidence](kubernetes/STAGE15_VERIFICATION.md).
+Kafka partition assignment is separate from HTTP load balancing. Inspect actual group members/assignments rather than inferring them from HTTP counts. See [the complete demo](kubernetes/LOAD_BALANCING.md) for the commands and expected interpretation.
 
 ## Testing strategy
 
@@ -335,7 +335,7 @@ if ($result.FailedCount -gt 0) { throw 'PowerShell contract tests failed.' }
 
 The Python command requires those tools on PATH; run the shell-helper contract in a POSIX-capable development environment if they are unavailable natively. Application runtime on Windows does not require WSL. Stop known `java -jar ...target...` processes before `clean` on Windows to avoid JAR locks. No real provider profile is part of the normal gate.
 
-See [final documentation verification](docs/documentation-verification.md) for the fresh final test counts/checks and [Stage 17 verification](docs/stage17-verification.md) for separately executed real pipeline, duplicate replay, outage, model and observability evidence. Historical reports are dated observations, not claims about a currently running deployment or benchmark results.
+The last full automated verification on **November 19, 2026** passed **612 Java tests**, **21 packaging/configuration tests**, and **28 PowerShell contract tests**, with zero failures, errors or skips. These are recorded test counts, not performance benchmarks. The optional paid-provider profile is separate from this normal test gate; rerun the commands above to verify your checkout and environment.
 
 ## Example API requests
 
@@ -394,7 +394,7 @@ Incident statuses are OPEN, INVESTIGATING and RESOLVED; severities are LOW, MEDI
 
 ## Example AI analysis
 
-Hand-written **illustrative excerpt**, not output from a new provider call. Only the health evidence entry is shown for brevity; a complete successful response also contains the mandatory incident/related-event observations and any additional captured reads.
+**Illustrative response excerpt**, not a captured provider result. Only the health evidence entry is shown for brevity; a complete successful response also contains the mandatory incident/related-event observations and any additional captured reads.
 
 ```json
 {
@@ -422,7 +422,7 @@ Hand-written **illustrative excerpt**, not output from a new provider call. Only
 }
 ```
 
-The hypothesis/recommendations can vary; observations come from server-captured MCP results. An empty coverage-limitations array is not proof of causality or model correctness. Actual real-provider verification and evidence handles are recorded in [Stage 17](docs/stage17-verification.md).
+The hypothesis/recommendations can vary; observations come from server-captured MCP results. An empty coverage-limitations array is not proof of causality or model correctness. Inspect the evidence and limitations in your own analysis response before accepting its hypothesis.
 
 ## Observability
 
@@ -430,7 +430,7 @@ Every application exposes only read-only `/actuator/health`, `/actuator/info`, `
 
 Prometheus scrapes six applications directly; Grafana provisions one seven-panel dashboard for event processing, incident creations/active state, errors, processing/analysis latency and scrape health. Creation exports as `incident_incidents_total`. Per-process counters reset on restart; the active-incidents gauge reads shared database state and uses `max`, not a replica sum.
 
-Structured JSON logs carry the original event `traceId` in scoped MDC at relevant event boundaries. IDs are not custom metric labels. This is log correlation, not distributed tracing; no centralized log platform is implemented. Scraping and dashboard refresh never invoke the model. See [the observability guide](observability/README.md) and [the verified dashboard capture](docs/stage16-dashboard.png).
+Structured JSON logs carry the original event `traceId` in scoped MDC at relevant event boundaries. IDs are not custom metric labels. This is log correlation, not distributed tracing; no centralized log platform is implemented. Scraping and dashboard refresh never invoke the model. See [the observability guide](observability/README.md) and [an example dashboard from a synthetic run](docs/dashboard.png).
 
 ## Design decisions
 
@@ -487,12 +487,10 @@ kubernetes/                  Local manifests and Service-balancing demo
 observability/               Prometheus/Grafana configuration
 scripts/                     Explicit synthetic smoke and PowerShell contracts
 tests/packaging/             Docker/Kubernetes/monitoring contracts
-docs/                        Setup/API guides and dated verification evidence
+docs/                        Setup/API guides and an example dashboard
 ```
 
 The display name is **Incident Response Platform**, the Maven parent/Compose project is `incident-response-platform`, and the checkout can remain `incident-response`. Module, image and namespace identifiers are preserved because scripts/configuration already depend on them. No directory rename is required. Historical `stage14`/`stage15` image tags remain documented demo labels, not release promises.
-
-Generated build/test outputs and private env files stay ignored. Local assistant resume notes are not public documentation; dated verification reports are intentional project evidence, not generated junk.
 
 ## Further documentation
 
@@ -501,5 +499,3 @@ Generated build/test outputs and private env files stay ignored. Local assistant
 - [Complete API and manual MCP examples](docs/api-examples.md)
 - [Kubernetes setup](kubernetes/README.md) and [HTTP distribution versus Kafka assignments](kubernetes/LOAD_BALANCING.md)
 - [Observability](observability/README.md) and [diagnostic-read resilience](diagnostics-mcp-server/README.md)
-- [Final documentation verification](docs/documentation-verification.md)
-- Dated evidence: [Docker](docs/stage13-verification.md), [Kubernetes](kubernetes/VERIFICATION.md), [load balancing](kubernetes/STAGE15_VERIFICATION.md), [observability](docs/stage16-verification.md), [full end-to-end verification](docs/stage17-verification.md)

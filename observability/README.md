@@ -10,9 +10,9 @@ Spring Boot services
   → Grafana (query the provisioned Prometheus datasource)
 ```
 
-No new service is inserted into the event-processing or analysis path. The six applications do not depend on Prometheus or Grafana. Detection thresholds, Kafka topics/groups/keys/acks, Redis keys/windows/deduplication, database migrations, MCP tools, model options/tool loop, gateway routes and REST DTOs are unchanged. Metrics scraping never calls the model or mutates incidents.
+Prometheus and Grafana observe the platform without participating in event processing or analysis. The six applications do not depend on them. Metrics scraping never calls the model, mutates incidents or changes detection/correlation behavior.
 
-All six services add the Spring Boot-managed `io.micrometer:micrometer-registry-prometheus` dependency, without upgrading Spring Boot, Java, Spring AI, Spring Cloud or JUnit. Structured logging uses Boot's built-in Logstash JSON support rather than another logging dependency. The only Kubernetes source change is the common read-only Actuator allowlist; the existing cluster/images are not redeployed by this Compose verification. Existing stage14/stage15 images must be rebuilt through the existing image workflow before Kubernetes pods can expose the new registry/instrumentation.
+All six services use the Spring Boot-managed `io.micrometer:micrometer-registry-prometheus` dependency. Structured logging uses Boot's built-in Logstash JSON support. Build and load Kubernetes images from the current checkout before expecting its instrumentation in the pods; rebuilding Compose images does not update a separate Kubernetes deployment. Prometheus and Grafana workloads are supplied by Compose, not the Kubernetes manifests.
 
 ## Startup — Windows PowerShell
 
@@ -33,7 +33,7 @@ docker compose ps
 
 The full stack has eleven long-running healthy containers: six applications, PostgreSQL, Kafka, Redis, Prometheus and Grafana. `kafka-init` is a successful exited one-shot job, not a twelfth running server. Health does not establish real-provider availability.
 
-For an existing full project, carry the same explicit project/env-file arguments into every command and every new terminal. For example, the separately retained Stage 16 verification project uses the exact argument array recorded in `docs/stage16-verification.md`. Do not reuse another project's incident UUID or assume an old `$dc` variable selects the intended stack.
+For an existing project, carry the same explicit project/env-file arguments into every command and every new terminal. See [Docker operation and isolated demos](../docs/docker.md) for a complete example. Do not reuse another project's incident UUID or assume an old `$dc` variable selects the intended stack.
 
 If you need a separate fresh project, create a new ignored `.env.observability-local` containing your own private DB credentials and all host-port overrides. Use a different DB/Kafka/Redis publication and all six different HTTP ports; include `PROMETHEUS_PORT` and `GRAFANA_PORT`. Then use `--project-name` and both ordered `--env-file` arguments consistently. Do not delete/reset another project's volumes or resolve its incidents to make a smoke repeatable. Host-port overrides do not change internal Service DNS or scrape targets.
 
@@ -59,7 +59,7 @@ Every Spring service exposes only these read-only management endpoints on its ex
 - `/actuator/metrics` — Micrometer meter names; `/actuator/metrics/<name>` shows measurements.
 - `/actuator/prometheus` — Prometheus text/OpenMetrics export.
 
-Access defaults to none; JMX exposure and `/actuator` discovery are disabled. `/actuator/env`, `/actuator/configprops`, `/actuator/beans`, `/actuator/heapdump`, `/actuator/loggers`, gateway administration and shutdown are not enabled. Metrics remain unauthenticated development endpoints containing operational data. Published ports bind host loopback; use authentication/TLS/network controls before exposing anything outside a trusted local network. This stage does not introduce a production security platform.
+Access defaults to none; JMX exposure and `/actuator` discovery are disabled. `/actuator/env`, `/actuator/configprops`, `/actuator/beans`, `/actuator/heapdump`, `/actuator/loggers`, gateway administration and shutdown are not enabled. Metrics remain unauthenticated development endpoints containing operational data. Published ports bind host loopback; use authentication/TLS/network controls before exposing anything outside a trusted local network.
 
 ```powershell
 # Default incident-service host port; substitute the selected project's binding.
@@ -144,7 +144,7 @@ docker compose @dc port api-gateway 8081
 .\scripts\smoke-docker.ps1 -ProjectName $project -EnvFile $files -Gateway 'http://127.0.0.1:28081' -IncludeAi
 ```
 
-`-IncludeAi` authorizes one analysis HTTP POST, potentially several bounded provider rounds; it is never retried automatically and can incur provider charges. All normal automated tests remain offline. If the provider fails, the error counter and error-duration observation should still be recorded; do not confuse that with a successful AI response.
+`-IncludeAi` authorizes one analysis HTTP POST, potentially several bounded provider rounds; it is never retried automatically and can incur provider charges. Normal automated model tests do not contact a real provider. If the provider fails, the error counter and error-duration observation should still be recorded; do not confuse that with a successful AI response.
 
 Before the smoke, inspect Prometheus targets and capture zero counters after initial successful scrapes. Afterwards:
 
@@ -156,17 +156,17 @@ Before the smoke, inspect Prometheus targets and capture zero counters after ini
 - Inspect JSON event/incident container logs and match the simulator's traceId through receipt, publishing, consumption, processing, correlation and automatic creation. Scoped MDC is restored on success/error; logs do not include event messages or metadata.
 - Verify Grafana's provisioned datasource connection and dashboard queries return the same real data as Prometheus. View the short burst/latencies in the time window containing the scenario; idle recent rates can legitimately return to zero.
 
-For the measured Stage 16 run, exact context, counts and test outcomes, read `../docs/stage16-verification.md`. Do not reuse its incident ID against a different database.
+Use the incident ID and gateway binding returned by your selected project. IDs from a different database are not valid evidence for this run. An [example dashboard](../docs/dashboard.png) illustrates the provisioned panels; its historical values are not a benchmark or a claim about your current deployment.
 
 ## Troubleshooting / safety
 
-- **Targets DOWN initially:** wait for the selected applications to become healthy and another scrape. Inspect only the selected project's service logs; confirm exporter HTTP 200, container DNS and internal ports. Existing pre-Stage16 images do not contain the new registry until rebuilt.
+- **Targets DOWN initially:** wait for the selected applications to become healthy and another scrape. Inspect only the selected project's service logs; confirm exporter HTTP 200, container DNS and internal ports. Rebuild/load outdated application images from the current checkout if they lack the exporter.
 - **Observer unhealthy:** inspect `docker compose @dc logs --tail 50 prometheus grafana`. Applications have no monitoring dependency and can continue processing. Never print resolved Compose configuration or unrestricted container environments; these contain credentials.
 - **Grafana asks for a login:** use the private password from your own env file; no default admin/admin password exists. The datasource/dashboard are already provisioned after login.
 - **No AI latency:** no analysis observations is normal until an analysis actually finishes. Run one intentionally authorized analysis against a real incident in that same project, not a provider call as a health probe.
 - **All active replicas show the same number:** expected for a shared database; use max, not sum.
 - **Metrics changed after restart:** counters/timers reset; the database-derived active gauge does not reset persistent state.
-- **Logs are JSON instead of plain text:** intentional. Docker Desktop/`docker compose logs` still display them; search/filter by the top-level traceId. This stage does not add Loki/Elasticsearch or centralized log storage.
+- **Logs are JSON instead of plain text:** intentional. Docker Desktop/`docker compose logs` still display them; search/filter by the top-level traceId. Loki/Elasticsearch and centralized log storage are not included.
 - **Another project is healthy but exec says not running:** correct the project/env-file argument array; do not start native applications or restart an old project on occupied ports.
 - **Retention/cleanup:** `docker compose @dc stop` stops only the selected project and preserves data. Do not use `down -v` as routine verification cleanup; it removes persistent audit/metrics/Grafana data.
 

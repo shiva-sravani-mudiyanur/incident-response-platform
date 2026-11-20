@@ -42,5 +42,5 @@ build/
 __pycache__/
 *.py[cod]
 
-# Local agent continuation notes are not public verification reports.
+# Local working notes
 /docs/*-resume.md
